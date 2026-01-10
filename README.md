@@ -81,7 +81,7 @@ Agents do focused work (design, implement). Commands define workflows that may u
 - Create temporary in-between session context. 
 - Write plans when not in plan mode. 
 
-Reset it for each major effort (feature, QA cycle, refactor).
+**Important: ** Claude never writes to this file unless instructed. This is for the end user to manage. 
 
 ## Philosophy
 
