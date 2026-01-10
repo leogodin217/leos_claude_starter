@@ -53,7 +53,7 @@ project/
 ├── CLAUDE.md                    # Principles, invariants, navigation
 ├── docs/
 │   ├── CAPABILITIES.md          # What the system does (status tracking)
-│   ├── SCRATCHPAD.md            # Current work tracking (phases, decisions)
+│   ├── SCRATCHPAD.md            # Temporary context used during or between sessions.  
 │   ├── architecture/
 │   │   ├── README.md            # Index, reading order
 │   │   ├── PROCESS.md           # Development process
@@ -77,11 +77,9 @@ Agents do focused work (design, implement). Commands define workflows that may u
 
 ## SCRATCHPAD Pattern
 
-`docs/SCRATCHPAD.md` tracks current work across sessions:
-- Goal and exit criteria
-- Decisions made (with rationale)
-- Phases with status
-- Context management notes for agents
+`docs/SCRATCHPAD.md` Temporary context that doesn't fit into established docs.  
+- Create temporary in-between session context. 
+- Write plans when not in plan mode. 
 
 Reset it for each major effort (feature, QA cycle, refactor).
 
