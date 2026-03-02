@@ -160,7 +160,3 @@ See `CUSTOMIZATION.md` for detailed guidance on:
    ├── Prune architecture doc, link to code
    └── Update CAPABILITIES.md (status: Complete)
 ```
-
-## Credits
-
-This template is based on the development process used in [Fabulexa](https://github.com/leogodin217/fabulexa_sim), a configuration-driven simulation engine for educational data generation.
