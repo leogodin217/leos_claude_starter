@@ -20,6 +20,9 @@ What this does not:
 
 People ask how to get started and this is a resource for them. That's it. I highly encourage everyone to learn by doing. Trial and error in unavoidable.  
 
+## Using CCLSP
+
+[CCLSP](https://github.com/ktnyt/cclsp) makes finding and reading code faster and more token efficient. It is mentioned throughout this repo. I highly recommend installing it. If you don't want to install it, then ask Claude to remove instructions on using it. 
 
 ## Quick Start
 

@@ -172,3 +172,10 @@ Concrete patterns to avoid and detect during review.
 | [docs/CAPABILITIES.md](docs/CAPABILITIES.md) | What the system does |
 | [docs/architecture/](docs/architecture/) | Design rationale and constraints |
 | [docs/sprints/](docs/sprints/) | Sprint specifications |
+
+
+## Code Navigation
+  - Prefer `mcp__cclsp__*` tools over reading entire files for understanding code structure.
+  - **Working with pylsp:** `find_definition`, `find_references`, `get_hover`, `get_diagnostics`, `rename_symbol`. Use these freely.
+  - For "who calls this function?" questions, use `find_references` or Grep.
+  - LSP tools work in both the main conversation and subagents.
