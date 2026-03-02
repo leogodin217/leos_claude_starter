@@ -6,7 +6,7 @@ A template for LLM-assisted software development with structured planning, imple
 
 This is how my process evolved over time to plan and write code wiith CC. 
 
-What thiis does:
+What this does:
 
 * Defines processes for starting and maintaining a new product. 
 * Uses what works for me in CC
