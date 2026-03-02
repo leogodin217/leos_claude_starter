@@ -90,24 +90,18 @@ Agents do focused work (design, implement). Skills define workflows that may use
 
 ## Session Analysis
 
-`/session` lets you analyze Claude Code session transcripts to understand how sessions went and improve your skills and processes over time.
+`/session` analyzes past Claude Code sessions so you can improve your skills and processes over time. Name sessions with `/rename` for easy lookup later.
 
-```
-/session list --recent 20              # List recent sessions across all projects
-/session find "sprint_execution"       # Find sessions by name (set via /rename)
-/session search "implement-sprint"     # Search transcript content by keyword
-/session summary <path|uuid|title>     # Summarize a session
-/session conversation <path> --max-chars 800  # Extract conversation flow
-/session tools <path>                  # View tool usage timeline
-```
+**Things you can ask:**
+- "List my recent sessions"
+- "Find sessions where I used `/implement-sprint`"
+- "Summarize that session — did it follow the spec?"
+- "How much context did that session use?"
+- "Show me the tool usage timeline"
+- "Did the subagents work as expected?"
+- Why didn't that session work well. How can we improve it. 
 
-**What you can learn from sessions:**
-- Did a `/command` execute its phases correctly?
-- Were subagents launched and used as expected?
-- How much context was consumed vs. budget?
-- Token efficiency — cache hit rates, oversized tool results, redundant file reads
-
-Sessions are stored at `~/.claude/projects/<project-slug>/`. Name them with `/rename` for easy lookup later.
+** We all know Claude likes to self flagellate and tell us everything it did wrong. This is not productive when improving processes. I found telling Claude that "I choose to blame processes not people or LLMs." steers the conversation in a far more productive direction. 
 
 ## Philosophy
 
