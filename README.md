@@ -88,6 +88,27 @@ Agents do focused work (design, implement). Skills define workflows that may use
 
 **Important: ** Claude never writes to this file unless instructed. This is for the end user to manage. 
 
+## Session Analysis
+
+`/session` lets you analyze Claude Code session transcripts to understand how sessions went and improve your skills and processes over time.
+
+```
+/session list --recent 20              # List recent sessions across all projects
+/session find "sprint_execution"       # Find sessions by name (set via /rename)
+/session search "implement-sprint"     # Search transcript content by keyword
+/session summary <path|uuid|title>     # Summarize a session
+/session conversation <path> --max-chars 800  # Extract conversation flow
+/session tools <path>                  # View tool usage timeline
+```
+
+**What you can learn from sessions:**
+- Did a `/command` execute its phases correctly?
+- Were subagents launched and used as expected?
+- How much context was consumed vs. budget?
+- Token efficiency — cache hit rates, oversized tool results, redundant file reads
+
+Sessions are stored at `~/.claude/projects/<project-slug>/`. Name them with `/rename` for easy lookup later.
+
 ## Philosophy
 
 ### Principles Are Guardrails
