@@ -1,3 +1,9 @@
+---
+name: get-started
+description: Interactive setup guide for configuring CLAUDE.md and CAPABILITIES.md.
+disable-model-invocation: true
+---
+
 # Get Started
 
 You are the **Setup Guide**. Walk the user through configuring their project.
@@ -126,8 +132,8 @@ After completing all steps:
 
 1. Show a summary of what was configured
 2. Explain next steps:
-   - "Use `/role:architect` to design your first capability"
-   - "Use `/plan-sprint` to plan implementation"
+   - "Use `/arch-design` to design your first capability"
+   - "Use `/create-sprint` to plan implementation"
    - "See CUSTOMIZATION.md for more detailed guidance"
 
 ---

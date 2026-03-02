@@ -1,9 +1,9 @@
-# Agents and Commands
+# Agents and Skills
 
 ## Overview
 
 **Agents** are workers with specific expertise, tools, and constraints.
-**Commands** are processes that orchestrate work.
+**Skills** are processes that orchestrate work.
 
 ```
 .claude/
@@ -11,20 +11,27 @@
 │   ├── architect.md
 │   └── implementer.md
 │
-└── commands/         # Processes
-    ├── role-architect.md
-    ├── plan-sprint.md
-    ├── implement-sprint.md
-    ├── review-sprint.md
-    └── audit-docs.md
+└── skills/           # Processes
+    ├── get-started/
+    ├── arch-design/
+    ├── arch-review/
+    ├── create-sprint/
+    ├── eval-sprint/
+    ├── implement-sprint/
+    ├── review-sprint/
+    ├── verify-sprint/
+    ├── audit-docs/
+    ├── review-tests/
+    ├── role-architect/
+    └── role-educator/
 ```
 
 ---
 
-## Agents vs Commands
+## Agents vs Skills
 
-| Aspect | Agents | Commands |
-|--------|--------|----------|
+| Aspect | Agents | Skills |
+|--------|--------|--------|
 | Purpose | Do specific work | Orchestrate workflows |
 | Scope | Single focused task | Multi-step processes |
 | Invocation | Task tool | Skill tool (slash commands) |
@@ -59,16 +66,22 @@ Use when: Implementing sprint phases.
 
 ---
 
-## Commands (Slash Commands)
+## Skills (Slash Commands)
 
-| Command | Purpose |
-|---------|---------|
+| Skill | Purpose |
+|-------|---------|
 | `/get-started` | Configure project (run once at setup) |
-| `/role:architect` | Switch to architecture/design mode |
-| `/plan-sprint` | Plan implementation phases |
+| `/arch-design` | Design interfaces, create architecture docs |
+| `/arch-review` | Review architecture decisions |
+| `/create-sprint` | Plan implementation phases |
+| `/eval-sprint` | Evaluate sprint spec before implementation |
 | `/implement-sprint` | Execute sprint phases |
 | `/review-sprint` | Review implementation against spec |
+| `/verify-sprint` | Final verification of sprint deliverables |
 | `/audit-docs` | Verify docs match implementation |
+| `/review-tests` | Review test quality |
+| `/role-architect` | Switch to architecture/design mode |
+| `/role-educator` | Switch to educator persona |
 
 ---
 
@@ -126,11 +139,15 @@ See CUSTOMIZATION.md for guidance on creating domain-specific agents.
 ## Workflow
 
 ```
-/plan-sprint
+/create-sprint
     │
     ├─→ architect agent (design contracts)
     │
     └─→ Produces: sprint spec
+
+/eval-sprint
+    │
+    └─→ Evaluate spec completeness
 
 /implement-sprint
     │
@@ -141,4 +158,12 @@ See CUSTOMIZATION.md for guidance on creating domain-specific agents.
     │       └─→ commit
     │
     └─→ Update docs when complete
+
+/review-sprint
+    │
+    └─→ Review implementation against spec
+
+/verify-sprint
+    │
+    └─→ Final verification of deliverables
 ```

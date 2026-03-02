@@ -186,24 +186,30 @@ Create an architecture doc when:
 
 ---
 
-## Step 6: Customize Commands
+## Step 6: Customize Skills
 
-The template includes five commands. Customize as needed.
+The template includes skills for the full development lifecycle. Customize as needed.
 
-### Modifying Commands
+### Modifying Skills
 
-Each command in `.claude/commands/` can be customized:
+Each skill in `.claude/skills/` can be customized:
 
 - **Add domain context** - Reference your specific docs
 - **Add checklists** - Domain-specific review items
 - **Add rules** - Domain-specific constraints
 
-### Adding New Commands
+### Adding New Skills
 
-Create new `.md` files in `.claude/commands/`:
+Create a new directory in `.claude/skills/` with a `SKILL.md` file:
 
 ```markdown
-# {Command Name}
+---
+name: skill-name
+description: Brief description of what this skill does.
+disable-model-invocation: true
+---
+
+# {Skill Name}
 
 You are the **{Role}**. {One sentence purpose.}
 
@@ -223,6 +229,12 @@ You are the **{Role}**. {One sentence purpose.}
 ### Example: Domain-Specific Reviewer
 
 ```markdown
+---
+name: security-review
+description: Security-focused code review.
+disable-model-invocation: true
+---
+
 # Security Review
 
 You are the **Security Reviewer**.
@@ -385,7 +397,7 @@ Use SCRATCHPAD for informal tracking alongside formal sprint specs.
 ### Quarterly
 
 - Review principles - still relevant?
-- Clean up unused commands
+- Clean up unused skills
 - Archive old sprint specs
 
 ---

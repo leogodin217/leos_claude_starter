@@ -97,7 +97,7 @@ Docs link to code, not duplicate it.
 1. NEED IDENTIFIED
    └── User request, bug, or roadmap item
 
-2. ARCHITECTURE (/role:architect)
+2. ARCHITECTURE (/arch-design)
    ├── Create docs/architecture/{feature}.md
    │   ├── Design decisions with rationale
    │   ├── Invariants
@@ -106,22 +106,28 @@ Docs link to code, not duplicate it.
        ├── Add capability section
        └── Status: "Not Started"
 
-3. SPRINT PLANNING (/plan-sprint)
+3. SPRINT PLANNING (/create-sprint)
    ├── Reference architecture doc
    ├── Break into phases
    └── Create docs/sprints/sprint-N.md
 
-4. IMPLEMENTATION (/implement-sprint)
+4. SPRINT EVALUATION (/eval-sprint)
+   └── Review spec for completeness before implementation
+
+5. IMPLEMENTATION (/implement-sprint)
    ├── Execute phases in order
    ├── Write tests alongside code
    └── Update CAPABILITIES.md status → "In Progress"
 
-5. REVIEW (/review-sprint)
+6. REVIEW (/review-sprint)
    ├── Verify against sprint spec
    ├── Check principle compliance
    └── Verify test coverage
 
-6. DOCUMENTATION (/audit-docs)
+7. VERIFICATION (/verify-sprint)
+   └── Final verification of sprint deliverables
+
+8. DOCUMENTATION (/audit-docs)
    ├── Prune architecture doc (link to code)
    ├── Update CAPABILITIES.md status → "Complete"
    └── Verify docs match implementation
