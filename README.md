@@ -93,15 +93,18 @@ Agents do focused work (design, implement). Skills define workflows that may use
 `/session` analyzes past Claude Code sessions so you can improve your skills and processes over time. Name sessions with `/rename` for easy lookup later.
 
 **Things you can ask:**
-- "List my recent sessions"
+- "List my recent sessions" / "List all sessions for this project"
 - "Find sessions where I used `/implement-sprint`"
 - "Summarize that session — did it follow the spec?"
+- "Give me a deep summary with subagent breakdown"
 - "How much context did that session use?"
 - "Show me the tool usage timeline"
-- "Did the subagents work as expected?"
-- Why didn't that session work well. How can we improve it. 
+- "Compare these two sessions" (diff)
+- Why didn't that session work well. How can we improve it.
 
-** We all know Claude likes to self flagellate and tell us everything it did wrong. This is not productive when improving processes. I found telling Claude that "I choose to blame processes not people or LLMs." steers the conversation in a far more productive direction. 
+Session analysis is not as deterministic as we'd like. The analyzer handles structured queries well (list, search, summary, diff), but for nuanced questions — "why did this go wrong?", "did it follow the spec?" — you'll often want to ask Claude to read the JSONL directly. The ad-hoc analysis recipes in the skill guide help with this.
+
+** We all know Claude likes to self flagellate and tell us everything it did wrong. This is not productive when improving processes. I found telling Claude that "I choose to blame processes not people or LLMs." steers the conversation in a far more productive direction.
 
 ## Philosophy
 
