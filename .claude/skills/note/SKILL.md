@@ -9,26 +9,39 @@ allowed-tools: Bash(python3 ~/.claude/skills/note/cli.py *)
 
 Vault-backed tracker for findings, features, questions, retros, decisions, and research. All operations route through `python3 ~/.claude/skills/note/cli.py`, which wraps the Obsidian CLI. The vault is **outside the repo** (OneDrive-synced).
 
-The skill is installed once at `~/.claude/skills/note` (a symlink into this starter repo) and is shared by every repo pointed at the same vault. `repo_root` resolves from git of cwd, so the active repo is inferred — never hardcoded per repo.
+The skill is installed once at `~/.claude/skills/note` (a symlink into this starter repo) and is shared by every repo pointed at the same vault. One shared vault can serve several related repos; each note is stamped with the `repo` it was created in.
 
-## Vault Configuration
+## Vault Configuration — the three-layer binding
 
-| Setting | Source | Default |
-|---|---|---|
-| Vault name | `OBSIDIAN_VAULT` env var or `vault` in config file | basename of `vault_path` |
-| Obsidian CLI path | `OBSIDIAN_CLI` env var or auto-detect | `/mnt/c/Users/<user>/AppData/Local/Programs/Obsidian/Obsidian.com` |
-| Repo root | `REPO_ROOT` env var or git of cwd | (from git) |
-| Vault path | `OBSIDIAN_VAULT_PATH` env var or `vault_path` in config file | **required — no auto-detect** |
+Three layers agree before any operation. This is what lets one vault serve several repos while keeping unrelated repos out.
 
-Optional `~/.config/note.json`:
+| Layer | Lives in | Owned by | Declares |
+|---|---|---|---|
+| **Repo binding** | `<repo>/.claude/note.json` (committed) | the repo | logical vault name + this repo's name in it |
+| **Machine registry** | `~/.config/note.json` (laptop-local) | the machine | vault name → absolute path on this disk |
+| **Vault registry** | `<vault>/meta/note-areas.md` (synced) | the vault | which repos are admitted + each repo's area list |
+
+Repo binding — committed, portable (no absolute paths):
+```json
+{ "vault": "Fabulexa", "repo": "composite" }
+```
+
+Machine registry `~/.config/note.json`:
 ```json
 {
   "obsidian_cli": "/mnt/c/Users/<user>/AppData/Local/Programs/Obsidian/Obsidian.com",
-  "vault_path": "/mnt/c/Users/<user>/OneDrive/vaults/<VaultName>"
+  "vaults": { "Fabulexa": "/mnt/c/Users/<user>/OneDrive/vaults/Fabulexa" }
 }
 ```
 
-Do **not** set `repo_root` in the config file. It is per-repo; git of cwd resolves it correctly in every repo, and a stale config value would silently attribute notes to the wrong repo when git detection fails.
+**Four fail-closed gates** (no default vault — an unbound repo cannot write notes):
+
+1. **UNBOUND** — no vault name from `--vault`, `NOTE_VAULT`, or the repo binding.
+2. **VAULT-UNKNOWN** — vault name not in the machine `vaults:` map.
+3. **REPO-UNREGISTERED** — repo name not a key in the vault `repos:` map.
+4. **AREA-INVALID** — at write time, `area` not in the current repo's area list.
+
+**Membership is a two-key handshake:** a repo is operational only when it *both* declares a binding *and* is registered in the vault's `repos:` map. Overrides `--vault` / `--vault-path` / `--repo` and `NOTE_VAULT` sit above the binding in precedence for reaching a second vault without editing committed state.
 
 ## Vault Layout
 
@@ -53,36 +66,43 @@ Filenames: slug only, lowercase, hyphenated (e.g., `state-store-resume-bug.md`).
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `type` | enum | yes | `finding \| feature \| question \| retro \| decision \| research` — controlled, rejected on bad value |
+| `type` | enum | yes | `finding \| feature \| question \| retro \| decision \| research` — controlled, immutable |
 | `status` | enum | yes | values per-type, see below |
 | `created` | date | yes | ISO date, auto-set on creation |
 | `updated` | date | yes | ISO date, auto-maintained on every write |
-| `area` | enum | no | controlled vocabulary, sourced at runtime from the shared vault's `meta/note-areas.md` (not hardcoded). One value per note; see that file for the current list. |
-| `tags` | list | no | free-form |
-| `related-notes` | list | no | wikilinks: `"[[other-note]]"` |
+| `repo` | enum | yes | which repo owns the note. **Stamped from the binding at creation, never author-typed, immutable.** A key in the vault `repos:` map. |
+| `area` | enum | yes | sub-package **within `repo`**, validated against that repo's list in `meta/note-areas.md`. `cross-cutting` = cross-package within one repo. |
+| `forward` | bool | no | `true` marks a forward note (resolves when its area ships). Filter with `list --forward`. |
+| `tags` | list | no | **closed vocabulary: only `planning-<slug>`** (workstream/roadmap membership). Every other tag is rejected. |
+| `related-notes` | list | no | wikilinks: `"[[other-note]]"` (resolve vault-wide, so cross-repo links are legal) |
 
 ### Per-type extensions
 
 | Type | Status values | Extra fields |
 |---|---|---|
-| `finding` | `open \| resolved \| deferred` | `severity` (req: `critical \| warning \| trivial` — urgency only), `kind` (req: `bug \| nit \| gap \| design` — what the finding *is*), `related-code` (list), `discovered-in` (req: `<context>` or `<context>__<instance>`, context ∈ `qa \| code-review \| other`) |
+| `finding` | `open \| resolved \| deferred` | `severity` (req: `critical \| warning \| trivial` — urgency), `kind` (req: `bug \| nit \| gap \| design` — what it *is*), `discovered-in` (req: controlled context, below), `batch` (free slug), `related-code` (list) |
 | `feature` | `proposed \| scheduled \| implemented \| deferred` | `priority` (`p0 \| p1 \| p2`), `depends-on` (wikilinks), `related-code` |
 | `question` | `open \| answered` | `blocking` (bool), `answered-by` (wikilink or repo path) |
 | `retro` | (no status) | `sprint` (req, repo path), `sprint-end` (req, date) |
 | `decision` | `active \| superseded` | `decided-on` (req, date), `alternatives` (text), `supersedes` (wikilink) |
 | `research` | `in-progress \| complete \| abandoned` | `sources` (URL list), `conclusion` (text) |
 
+**`discovered-in` + `batch` (findings).** `discovered-in` is a controlled *context* — how the finding surfaced: `qa \| code-review \| arch-design \| arch-review \| planning \| other`. `batch` is a free grouping slug (sprint / round / topic, e.g. `snapshot-resume`, `nhs-perf`). They were one composite `context__instance` field; now split so each half is queryable.
+
+**Provenance vs lifecycle.** `type`, `repo`, `area`, `created`, `discovered-in`/`batch` are immutable provenance (set once). Only `status`/`updated` and terminal fields change over a note's life.
+
 ## Validation Rules
 
-1. **`type` must be one of the six controlled values.** Reject otherwise.
+1. **`type` must be one of the six controlled values.** Immutable — `set type` and `set repo` are rejected (both are provenance; `type` would need a folder move).
 2. **`status` must be valid for the note's `type`.** Reject otherwise.
-3. **`area` is required at creation and must be one of the controlled values.** No default. Use `--needs-triage` to find legacy notes with an empty `area`.
-4. **`severity`, `kind`, and `discovered-in` are required at creation for findings.** No default. `severity` is urgency (`critical \| warning \| trivial`); `kind` is what the finding is (`bug` = code wrong; `nit` = code works, cleanliness; `gap` = missing test coverage or docs; `design` = architectural or process concern). They are orthogonal.
-5. **`priority` is optional at creation for features**, set during triage.
-5a. **`discovered-in` is required for findings.** The part before the first `__` must be a valid context (`qa \| code-review \| other`); the optional `__<instance>` suffix is a free grouping slug (e.g. `qa__base-layer`, `code-review__tick-roles-mutations`). Records where a finding was surfaced; do not duplicate it as a tag. **Property values use `__` as the domain/topic separator, never `:` — Obsidian renders colon-bearing values as broken links. Colons are rejected at write and flagged by `lint`.**
-6. **`related-code` paths must exist under `repo_root` at write time** (file portion, ignoring `::symbol` suffix). Reject on missing path at creation / `set`. Not re-checked by `lint`: paths point outside the vault at code that legitimately moves over a note's lifetime, and in a shared multi-repo vault a path only resolves from its own checkout.
-7. **`related-notes` wikilinks must resolve to existing vault notes.** Reject on missing target.
-8. **Filename slugs must be unique within their folder.** Disambiguate with `-2`, `-3` suffix on collision.
+3. **`repo` is stamped from the binding, not author-supplied.** It must be a key in the vault `repos:` map (else REPO-UNREGISTERED at config time). Immutable after creation.
+4. **`area` is required and must be in the note's `repo` area list.** No default. `cross-cutting` means cross-package within one repo. `lint` validates each note's area against *its own* repo's list.
+5. **`severity`, `kind`, and `discovered-in` are required at creation for findings.** `severity` is urgency (`critical \| warning \| trivial`); `kind` is what the finding is (`bug` = code wrong; `nit` = cleanliness; `gap` = missing coverage/docs; `design` = architectural/process); orthogonal. `discovered-in` must be a controlled context (`qa \| code-review \| arch-design \| arch-review \| planning \| other`) — validated at write **and** by `lint`. Put any grouping slug in `batch` (free; no `:`).
+6. **`tags` are a closed vocabulary — only `planning-<slug>`.** Any other tag is rejected at write and by `lint`. Topic → `area`/`repo`; how it surfaced → `discovered-in`; finding kind → `kind`.
+7. **`priority` is optional at creation for features**, set during triage.
+8. **`related-code` paths must exist under the checkout at write time** (file portion, ignoring `::symbol`). Reject on missing path at creation / `set`. **Not checked by `lint`**: notes are historical records and the code they point at legitimately moves; in a shared multi-repo vault a path only resolves from its own checkout.
+9. **`related-notes` wikilinks must resolve to existing vault notes** (vault-wide, so cross-repo links are legal). Reject on missing target.
+10. **Filename slugs must be unique within their folder.** Disambiguate with `-2`, `-3` suffix on collision.
 
 ## Status Transition Behavior
 
@@ -112,28 +132,35 @@ All run via `python3 ~/.claude/skills/note/cli.py <command> [args]`.
 
 Create a new note. Generates slug, writes frontmatter from per-type template directly to the vault filesystem (atomic write), then opens in Obsidian.
 
+`repo` is stamped automatically from the binding — you never pass it.
+
 ```
 python3 ~/.claude/skills/note/cli.py new finding "State store resume bug" \
   --severity critical \
   --kind bug \
   --area substrate \
-  --discovered-in code-review__snapshot-resume \
+  --discovered-in code-review \
+  --batch snapshot-resume \
   --code packages/substrate/src/snapshot.py::resume_kernel
 ```
 
 Options:
-- `--area <name>` (**required**, controlled list)
+- `--area <name>` (**required**, must be in this repo's area list)
 - `--severity {critical|warning|trivial}` (required for findings)
 - `--kind {bug|nit|gap|design}` (required for findings)
-- `--discovered-in <context>[__<instance>]` (**required for findings**; context ∈ `qa|code-review|other`)
+- `--discovered-in {qa|code-review|arch-design|arch-review|planning|other}` (**required for findings**)
+- `--batch <slug>` (findings; free grouping slug — sprint/round/topic)
+- `--forward` (mark as a forward note)
 - `--priority {p0|p1|p2}` (features)
-- `--code <path> [<path> ...]` (must exist under repo_root)
+- `--code <path> [<path> ...]` (must exist under the current checkout)
 - `--notes "[[other-note]]" ...` (must resolve in vault)
-- `--tags <tag> [<tag> ...]`
+- `--tags planning-<slug> [...]` (only `planning-*` tags are accepted)
 - `--body "<text>"` (initial body content; appended after template sections)
 - `--no-open` (skip opening in GUI)
 
-Output: `Created finding/state-store-resume-bug.md`
+Top-level overrides (before the subcommand): `--vault <name>`, `--vault-path <path>`, `--repo <name>` for reaching a second vault or repo without editing committed state.
+
+Output: `Created findings/state-store-resume-bug.md`
 
 ### `status <slug> <new-status> [--reason "<text>"]`
 
@@ -146,22 +173,22 @@ python3 ~/.claude/skills/note/cli.py status state-store-resume-bug resolved \
 
 ### `set <slug> <field> <value> [<value> ...]`
 
-Update a single frontmatter field. Validates if the field is controlled (`type`, `status`, `area`, `severity`, `kind`, `priority`, `discovered-in`).
+Update a single frontmatter field. Validates if the field is controlled (`status`, `area`, `severity`, `kind`, `priority`, `discovered-in`, `batch`, `tags`).
 
 ```
 python3 ~/.claude/skills/note/cli.py set state-store-resume-bug priority p0
 ```
 
-**Scalar fields** require exactly one value and are written via the Obsidian CLI so the running GUI arbitrates.
+**Scalar fields** require exactly one value and are written via the Obsidian CLI so the running GUI arbitrates. `area` is validated against the note's *own* repo's area list. `forward` and `blocking` are boolean.
 
-**List fields** (`tags`, `related-notes`, `related-code`, `depends-on`, `sources`) accept one or more values and **replace the existing list in full** (no append). Written via direct atomic filesystem rewrite. `related-notes` and `related-code` are validated before write.
+**List fields** (`tags`, `related-notes`, `related-code`, `depends-on`, `sources`) accept one or more values and **replace the existing list in full** (no append). Written via direct atomic filesystem rewrite. `tags` (must be `planning-*`), `related-notes`, and `related-code` are validated before write.
 
 ```
 python3 ~/.claude/skills/note/cli.py set my-finding related-notes "[[a]]" "[[b]]"
-python3 ~/.claude/skills/note/cli.py set my-feature tags forward-note nhs-roadmap
+python3 ~/.claude/skills/note/cli.py set my-feature tags planning-nhs
 ```
 
-`type` cannot be changed via `set` (file would need to move folders). Use `migrate` if it ever exists.
+`type` and `repo` cannot be changed via `set` — both are immutable provenance (`type` would need a folder move; `repo` is stamped at creation).
 
 ### `list [filters] [--format text|json]`
 
@@ -170,22 +197,24 @@ List notes by filter. Default (no `--status`): non-terminal statuses only — `o
 ```
 python3 ~/.claude/skills/note/cli.py list --type finding --status open
 python3 ~/.claude/skills/note/cli.py list --type finding --status all   # every status
-python3 ~/.claude/skills/note/cli.py list --area substrate
+python3 ~/.claude/skills/note/cli.py list --repo forge
 python3 ~/.claude/skills/note/cli.py list --needs-triage    # area is empty
 ```
 
 Options:
 - `--type <type>` — filter by type
 - `--status <status>` — filter by status (must be valid for filtered type). Pass `all` to list every status, including terminal ones.
+- `--repo <name>` — filter by owning repo
 - `--area <name>` — filter by area
+- `--forward` — only forward notes
 - `--needs-triage` — notes with empty `area`
-- `--tags <tag> [<tag> ...]` — require all listed tags (AND semantics)
+- `--tags planning-<slug> [...]` — require all listed tags (AND semantics)
 - `--kind {bug|nit|gap|design}` — filter findings by kind
-- `--discovered-in <slug>` — filter findings by `discovered-in`
+- `--discovered-in {qa|code-review|arch-design|arch-review|planning|other}` — filter findings by context
 - `--format {text|json}` — default `text`
 
 ```
-python3 ~/.claude/skills/note/cli.py list --tags forward-note --area dialect-tick
+python3 ~/.claude/skills/note/cli.py list --forward --area dialect-tick
 python3 ~/.claude/skills/note/cli.py list --type finding --status all --kind nit
 ```
 
@@ -216,26 +245,25 @@ Open a note in Obsidian's GUI.
 
 ### `check`
 
-Run pre-flight only. Useful when starting a session. Prints vault, vault_path, repo_root, obsidian_cli.
+Run pre-flight only. Useful when starting a session. Prints vault, vault_path, repo, repo_root, obsidian_cli — and surfaces the UNBOUND / VAULT-UNKNOWN / REPO-UNREGISTERED gates if the binding is missing or wrong.
 
 ### `tags [--format text|json]`
 
-Aggregate tag usage across the entire vault. Output is sorted by count descending; ties alphabetical. Use this **before inventing a new tag** to discover existing ones and avoid drift (e.g. `nhs-roadmap` vs `roadmap`).
+Aggregate tag usage across the entire vault. Sorted by count descending; ties alphabetical.
 
-Tags are free-form and carry **topic** only — `kind`, `severity`, and `discovered-in` are fields, not tags, so don't duplicate them. **Tags use `-` as their only separator and must not contain `:` — colons render as broken tag-pills in Obsidian and are rejected at write and by `lint`.** Roadmap / planning membership uses a namespaced tag: `planning-<slug>` (e.g. `planning-nhs`). The `planning-` prefix self-documents the tag as a planning marker rather than a topic; it is convention, not enforced. Domain/topic grouping that needs a structured separator belongs in the `discovered-in` property (which uses `__`), not in a tag.
+Tags are a **closed vocabulary — only `planning-<slug>`** (workstream / roadmap membership, e.g. `planning-nhs`). This is the one facet no single-valued field can express. Everything a tag used to carry now lives in a field: topic → `area`/`repo`, how a finding surfaced → `discovered-in`, finding kind → `kind`. Any non-`planning-*` tag is rejected at write and by `lint`.
 
 ```
 python3 ~/.claude/skills/note/cli.py tags
-# forward-note                24
-# nhs-roadmap                  8
-# ...
+# planning-nhs                38
+# planning-tales               1
 ```
 
 ### `lint`
 
 Validate every note's frontmatter against the controlled schema. Frontmatter-only — does not scan body prose.
 
-Checks per note: `area` is set and valid, `status` is set and valid for the type, `severity` and `kind` are set and valid for findings, `related-notes` wikilinks resolve. `related-code` is intentionally not checked — it points outside the vault at code that moves over a note's lifetime, and only resolves from its own checkout in a shared multi-repo vault (it is still validated at write time). `priority` is also not checked (features may be untriaged).
+Checks per note: `repo` is set and admitted; `area` is set and in the note's **own repo's** area list; `status` is set and valid for the type; `severity`/`kind`/`discovered-in` set and valid for findings; `tags` are all `planning-*`; `related-notes` wikilinks resolve. `related-code` is intentionally not checked — notes are historical records and the code they point at moves; it only resolves from its own checkout anyway (still validated at write time). `priority` is not checked (features may be untriaged).
 
 Exits 0 if all notes pass, 1 if any errors. Output is one line per error: `<vault-relpath>: <issue>`.
 
@@ -261,7 +289,7 @@ Type-folder is auto-detected from the resolved file's location.
 ```
 python3 ~/.claude/skills/note/cli.py new finding "Title" \
   --severity critical --kind bug --area <pkg> \
-  --discovered-in code-review__<sprint-or-topic> --code <path>
+  --discovered-in code-review --batch <sprint-or-topic> --code <path>
 ```
 
 ### Triaging a captured note
@@ -285,22 +313,16 @@ python3 ~/.claude/skills/note/cli.py list --needs-triage
 python3 ~/.claude/skills/note/cli.py moc "Critical" --format json
 ```
 
-### Discovering tags before inventing a new one
-
-```
-python3 ~/.claude/skills/note/cli.py tags
-```
-
 ### Validating the vault after a batch of edits
 
 ```
 python3 ~/.claude/skills/note/cli.py lint
 ```
 
-### Resolving forward-notes when a sprint ships subsystem X
+### Resolving forward notes when a sprint ships subsystem X
 
 ```
-python3 ~/.claude/skills/note/cli.py list --tags forward-note --area <X>
+python3 ~/.claude/skills/note/cli.py list --forward --area <X>
 # For each result:
 python3 ~/.claude/skills/note/cli.py status <slug> complete --reason "..."   # research
 python3 ~/.claude/skills/note/cli.py status <slug> answered --reason "..."   # questions
@@ -325,9 +347,10 @@ python3 ~/.claude/skills/note/cli.py path <slug>
 
 - **Vault is outside the repo.** No context pollution during codebase searches.
 - **Status drives lifecycle, not folders.** Status flips are property edits, not file moves. Wikilinks survive.
-- **Per-type schemas are strict for `type` and `status`.** Loose for everything else.
+- **Provenance is immutable; lifecycle mutates.** `type`, `repo`, `area`, `created` are set once and controlled; only `status`/`updated` change over a note's life.
+- **Fail closed on binding.** No default vault. An unbound or unregistered repo cannot write notes — membership is the two-key handshake (repo binding + vault registration).
 - **Writes to existing notes go through Obsidian** (via CLI subprocess) so the running GUI arbitrates. New-note creation writes directly to the vault filesystem — no contention is possible since the target file doesn't exist.
-- **Repo never references vault.** One-way: vault → repo. If a vault note becomes load-bearing for active code, its content migrates into the repo.
+- **The repo names its vault, but holds no vault content.** The binding (`.claude/note.json`) is a routing pointer only. Content flow stays one-way vault → repo; if a vault note becomes load-bearing for active code, its content migrates into the repo.
 - **MOCs are the source of truth for views.** Skill calls `base:query`; doesn't reimplement filtering.
 
 ## Integration with Other Skills

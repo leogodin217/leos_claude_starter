@@ -45,10 +45,17 @@ Priority = Literal["p0", "p1", "p2"]
 
 VALID_SEVERITIES: tuple[str, ...] = ("critical", "warning", "trivial")
 VALID_KINDS: tuple[str, ...] = ("bug", "nit", "gap", "design")
-# `discovered-in` is `<context>` or `<context>__<instance>`. Only the context
-# (before the first `__`) is controlled; the instance is a free slug. Required
-# for findings.
-VALID_DISCOVERED_IN_CONTEXTS: tuple[str, ...] = ("qa", "code-review", "other")
+# `discovered-in` is a controlled context (how a finding surfaced). The free
+# grouping slug (old `__<instance>` suffix) is now the separate `batch` field.
+# Required for findings.
+VALID_DISCOVERED_IN_CONTEXTS: tuple[str, ...] = (
+    "qa",
+    "code-review",
+    "arch-design",
+    "arch-review",
+    "planning",
+    "other",
+)
 VALID_PRIORITIES: tuple[str, ...] = ("p0", "p1", "p2")
 VALID_TYPES: tuple[str, ...] = (
     "finding",
@@ -110,41 +117,52 @@ class Config:
     """Resolved skill configuration.
 
     Attributes:
-        vault: Obsidian vault name (passed as `vault=<name>` to the CLI).
-            Defaults to the `vault_path` basename.
+        vault: Obsidian vault name (passed as `vault=<name>` to the CLI),
+            resolved from --vault / NOTE_VAULT / the repo binding.
         obsidian_cli: Absolute path to the Obsidian CLI binary (the Windows
             `Obsidian.com` launcher, accessed from WSL via `/mnt/c/...`).
         repo_root: Absolute path to the active repo (used to validate
             `related-code` references on write).
         vault_path: Absolute path to the vault directory on the local
             filesystem (used for direct filesystem reads and new-note creation).
-        valid_areas: Controlled `area` vocabulary, loaded from the shared vault
-            at config time (see `load_valid_areas`).
+        repo: The current repo's key in the vault `repos` map, from the repo
+            binding (`<repo_root>/.claude/note.json`). Stamped onto new notes;
+            None only when a vault override is used without a binding.
+        repos_map: Full `repo -> areas` map from the vault registry
+            (`meta/note-areas.md`). Used to scope `area` per repo and to lint
+            every note against its own repo's area list.
+        valid_areas: Controlled `area` vocabulary for the CURRENT `repo`
+            (`repos_map[repo]`); empty when `repo` is None.
     """
 
     vault: str
     obsidian_cli: Path
-    repo_root: Path
+    repo_root: Path | None
     vault_path: Path
+    repo: str | None
+    repos_map: dict[str, tuple[str, ...]]
     valid_areas: tuple[str, ...]
 
 
-def load_valid_areas(vault_path: Path) -> tuple[str, ...]:
-    """Load the controlled area vocabulary from the shared vault.
+def load_repos_map(vault_path: Path) -> dict[str, tuple[str, ...]]:
+    """Load the `repo -> areas` registry from the shared vault.
 
-    Reads `<vault_path>/meta/note-areas.md`, parses its YAML frontmatter, and
-    returns the `areas` list. Single source of truth across every repo pointed
-    at this vault.
+    Reads `<vault_path>/meta/note-areas.md` and parses its YAML frontmatter
+    `repos:` mapping (each key a repo admitted to this vault, each value that
+    repo's controlled `area` list). Single source of truth across every repo
+    pointed at this vault: it both admits repos (the REPO-UNREGISTERED gate)
+    and scopes each repo's area vocabulary.
 
     Raises:
-        ConfigError: When the areas file is absent, has no YAML frontmatter,
-            lacks an `areas` key, or `areas` is empty / not a list of strings.
+        ConfigError: When the file is absent, has no YAML frontmatter, lacks a
+            `repos` key, or `repos` is not a mapping of repo -> non-empty
+            list-of-strings.
     """
     areas_file = vault_path / "meta" / "note-areas.md"
     if not areas_file.exists():
         raise ConfigError(
-            f"Area vocabulary file not found: {areas_file}. "
-            "Create it with a YAML frontmatter `areas:` list."
+            f"Vault registry file not found: {areas_file}. "
+            "Create it with a YAML frontmatter `repos:` map (repo -> area list)."
         )
     with areas_file.open(encoding="utf-8") as f:
         if f.readline().strip() != "---":
@@ -157,72 +175,101 @@ def load_valid_areas(vault_path: Path) -> tuple[str, ...]:
                 break
             fm_lines.append(line)
     parsed = yaml.safe_load("".join(fm_lines))
-    if not isinstance(parsed, dict) or "areas" not in parsed:
-        raise ConfigError(f"{areas_file} frontmatter lacks an `areas` key.")
-    areas = parsed["areas"]
-    if (
-        not isinstance(areas, list)
-        or not areas
-        or not all(isinstance(a, str) for a in areas)
-    ):
-        raise ConfigError(f"{areas_file} `areas` must be a non-empty list of strings.")
-    return tuple(areas)
+    if not isinstance(parsed, dict) or "repos" not in parsed:
+        raise ConfigError(f"{areas_file} frontmatter lacks a `repos` key.")
+    repos = parsed["repos"]
+    if not isinstance(repos, dict) or not repos:
+        raise ConfigError(f"{areas_file} `repos` must be a non-empty mapping.")
+    result: dict[str, tuple[str, ...]] = {}
+    for repo, areas in repos.items():
+        if (
+            not isinstance(areas, list)
+            or not areas
+            or not all(isinstance(a, str) for a in areas)
+        ):
+            raise ConfigError(
+                f"{areas_file} repos[{repo!r}] must be a non-empty list of strings."
+            )
+        result[str(repo)] = tuple(areas)
+    return result
 
 
-def load_config() -> Config:
-    """Resolve skill configuration from env vars and optional config file.
+def _read_repo_binding(repo_root: Path | None) -> dict:
+    """Read `<repo_root>/.claude/note.json` if present, else empty dict."""
+    if repo_root is None:
+        return {}
+    binding_file = repo_root / ".claude" / "note.json"
+    if not binding_file.exists():
+        return {}
+    try:
+        parsed = json.loads(binding_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise ConfigError(f"Cannot read repo binding {binding_file}: {exc}")
+    if not isinstance(parsed, dict):
+        raise ConfigError(f"{binding_file} must be a JSON object.")
+    return parsed
 
-    Resolution order per field:
-        1. Environment variable (`OBSIDIAN_VAULT`, `OBSIDIAN_CLI`, `REPO_ROOT`,
-           `OBSIDIAN_VAULT_PATH`).
-        2. `~/.config/note.json` if present.
-        3. Auto-detection (Obsidian CLI under `/mnt/c/Users/*/AppData/...`;
-           repo_root from git of cwd; `vault` from the `vault_path` basename,
-           which is how Obsidian names a vault by default).
-        4. No auto-detection for `vault_path` — raises ConfigError if missing.
 
-    `repo_root` is the exception: it is per-repo, so in a shared multi-repo
-    vault the active repo (git of cwd) takes precedence over the config
-    file's value. Precedence is REPO_ROOT env -> git of cwd -> config file.
+def load_config(
+    vault_override: str | None = None,
+    vault_path_override: str | None = None,
+    repo_override: str | None = None,
+) -> Config:
+    """Resolve skill configuration through the three-layer binding.
+
+    Three layers agree before any operation:
+      - Repo binding  (`<repo_root>/.claude/note.json`): logical vault name +
+        this repo's name in it. Committed, portable (no absolute paths).
+      - Machine registry (`~/.config/note.json` `vaults:` map): vault name ->
+        absolute path on this disk. Laptop-local.
+      - Vault registry (`<vault_path>/meta/note-areas.md` `repos:` map): which
+        repos are admitted, and each repo's area vocabulary.
+
+    Four fail-closed gates (Principle #7 — fail closed, no default vault):
+      1. UNBOUND          — no vault name (no --vault, NOTE_VAULT, or binding).
+      2. VAULT-UNKNOWN    — vault name not in the machine `vaults:` map.
+      3. REPO-UNREGISTERED — repo name not a key in the vault `repos:` map.
+      4. AREA-INVALID     — enforced later, at write time, per repo.
+
+    Args:
+        vault_override: --vault flag value (highest precedence for the name).
+        vault_path_override: --vault-path flag; bypasses the machine map.
+        repo_override: --repo flag; bypasses the binding's repo (rare).
 
     Returns:
-        Resolved Config.
+        Resolved Config (`repo` may be None only under a vault override with
+        no binding; write ops that need it enforce presence themselves).
 
     Raises:
-        ConfigError: When `obsidian_cli` cannot be located, `repo_root`
-            cannot be resolved, `vault_path` is not set, or the vault's
-            `meta/note-areas.md` area vocabulary is missing or malformed.
+        ConfigError: On any of the four gates, a missing Obsidian CLI, or a
+            missing / malformed vault registry.
     """
-    # Start with empty values.
-    vault: str | None = None
-    obsidian_cli: str | None = None
-    repo_root: str | None = None
-    vault_path: str | None = None
+    # --- repo_root (git of cwd; per-repo, used to find the binding) ---
+    repo_root: str | None = os.environ.get("REPO_ROOT")
+    if repo_root is None:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            repo_root = result.stdout.strip()
+    repo_root_path = Path(repo_root) if repo_root else None
 
-    # Step 1: Environment variables.
-    vault = os.environ.get("OBSIDIAN_VAULT")
-    obsidian_cli = os.environ.get("OBSIDIAN_CLI")
-    repo_root = os.environ.get("REPO_ROOT")
-    vault_path = os.environ.get("OBSIDIAN_VAULT_PATH")
+    binding = _read_repo_binding(repo_root_path)
 
-    # Step 2: Config file.
-    # repo_root is held aside as a fallback only: it is per-repo, so git of
-    # cwd (Step 3) takes precedence over the config file's shared value.
-    cfg_repo_root: str | None = None
+    # --- machine registry ---
+    obsidian_cli: str | None = os.environ.get("OBSIDIAN_CLI")
+    vaults_map: dict[str, str] = {}
     config_file = Path.home() / ".config" / "note.json"
     if config_file.exists():
         with config_file.open() as f:
             cfg = json.load(f)
-        if vault is None and "vault" in cfg:
-            vault = cfg["vault"]
         if obsidian_cli is None and "obsidian_cli" in cfg:
             obsidian_cli = cfg["obsidian_cli"]
-        if "repo_root" in cfg:
-            cfg_repo_root = cfg["repo_root"]
-        if vault_path is None and "vault_path" in cfg:
-            vault_path = cfg["vault_path"]
+        if isinstance(cfg.get("vaults"), dict):
+            vaults_map = {str(k): str(v) for k, v in cfg["vaults"].items()}
 
-    # Step 3: Auto-detection.
     if obsidian_cli is None:
         pattern = "/mnt/c/Users/*/AppData/Local/Programs/Obsidian/Obsidian.com"
         matches = glob.glob(pattern)
@@ -234,32 +281,49 @@ def load_config() -> Config:
             )
         obsidian_cli = matches[0]
 
-    if repo_root is None:
-        # Per-repo: prefer the active repo (git of cwd) over the config
-        # file's shared value, falling back to it only when not in a repo.
-        result = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            capture_output=True,
-            text=True,
+    # --- Gate 1: vault name (UNBOUND) ---
+    vault: str | None = (
+        vault_override
+        or os.environ.get("NOTE_VAULT")
+        or (binding.get("vault") if binding else None)
+    )
+    if vault is None:
+        raise ConfigError(
+            "UNBOUND: this repo is not bound to a vault. "
+            "Add .claude/note.json with {\"vault\": \"<name>\", \"repo\": \"<name>\"}, "
+            "or pass --vault <name> / set NOTE_VAULT."
         )
-        if result.returncode == 0:
-            repo_root = result.stdout.strip()
-        elif cfg_repo_root is not None:
-            repo_root = cfg_repo_root
-        else:
+    vault = str(vault)
+
+    # --- Gate 2: vault path (VAULT-UNKNOWN) ---
+    vault_path: str | None = (
+        vault_path_override
+        or os.environ.get("OBSIDIAN_VAULT_PATH")
+        or vaults_map.get(vault)
+    )
+    if vault_path is None:
+        known = ", ".join(sorted(vaults_map)) or "(none)"
+        raise ConfigError(
+            f"VAULT-UNKNOWN: vault {vault!r} is not in the machine registry. "
+            f"Add it to ~/.config/note.json `vaults`, or pass --vault-path. "
+            f"Known vaults: {known}"
+        )
+
+    repos_map = load_repos_map(Path(vault_path))
+
+    # --- Gate 3: repo (REPO-UNREGISTERED) ---
+    repo: str | None = repo_override or (binding.get("repo") if binding else None)
+    if repo is not None:
+        repo = str(repo)
+        if repo not in repos_map:
+            known = ", ".join(sorted(repos_map))
             raise ConfigError(
-                "Cannot determine repo root. "
-                "Set REPO_ROOT env var, run inside a git repository, "
-                "or add repo_root to ~/.config/note.json."
+                f"REPO-UNREGISTERED: repo {repo!r} is not admitted to vault "
+                f"{vault!r}. Register it in {vault_path}/meta/note-areas.md "
+                f"`repos`. Admitted repos: {known}"
             )
 
-    # Step 4: vault_path — no auto-detection.
-    if vault_path is None:
-        raise ConfigError(
-            "vault_path is required but not set. "
-            "Set OBSIDIAN_VAULT_PATH env var or add vault_path to ~/.config/note.json. "
-            "Example: /mnt/c/Users/<user>/OneDrive/vaults/<VaultName>"
-        )
+    valid_areas = repos_map.get(repo, ()) if repo is not None else ()
 
     # `vault` defaults to the vault directory's name, which is how Obsidian
     # names a vault unless the user renamed it. Resolved after `vault_path`
@@ -270,9 +334,11 @@ def load_config() -> Config:
     return Config(
         vault=vault,
         obsidian_cli=Path(obsidian_cli),
-        repo_root=Path(repo_root),
+        repo_root=repo_root_path,
         vault_path=Path(vault_path),
-        valid_areas=load_valid_areas(Path(vault_path)),
+        repo=repo,
+        repos_map=repos_map,
+        valid_areas=valid_areas,
     )
 
 
@@ -588,52 +654,59 @@ def validate_kind(kind: str | None) -> None:
 
 
 def validate_discovered_in(value: str | None) -> None:
-    """Verify a discovered-in value's context prefix is controlled (or absent).
+    """Verify a discovered-in value is a controlled context (or absent).
 
-    The value is `<context>` or `<context>__<instance>`. Only the context
-    (before the first `__`) is checked against VALID_DISCOVERED_IN_CONTEXTS;
-    the optional instance is a free grouping slug.
-
-    Properties use `__` as the domain/topic separator, never `:` — Obsidian
-    renders colon-bearing property values as broken links.
+    `discovered-in` is now a bare context — one of
+    VALID_DISCOVERED_IN_CONTEXTS. The old `__<instance>` grouping suffix moved
+    to the separate free-slug `batch` field.
 
     Raises:
-        ValidationError: When the value contains a colon, or the context
-            prefix is not a valid context.
+        ValidationError: When the value is not a valid context.
     """
     if value is None or value == "":
         return
-    if ":" in value:
+    if value not in VALID_DISCOVERED_IN_CONTEXTS:
         raise ValidationError(
-            f"discovered-in value {value!r} contains ':'. Properties use '__' "
-            "as the domain/topic separator (e.g. 'qa__nhs'); colons render as "
-            "broken links in Obsidian."
+            f"discovered-in {value!r} is not a valid context. "
+            f"Allowed: {', '.join(VALID_DISCOVERED_IN_CONTEXTS)}. "
+            "Put any grouping slug in the separate `batch` field."
         )
-    context = value.split("__", 1)[0]
-    if context not in VALID_DISCOVERED_IN_CONTEXTS:
+
+
+def validate_batch(value: str | None) -> None:
+    """Verify a batch slug uses no colon (Obsidian renders colons as broken links).
+
+    Raises:
+        ValidationError: When the value contains ':'.
+    """
+    if value and ":" in value:
         raise ValidationError(
-            f"discovered-in context {context!r} is not valid. "
-            f"Allowed: {', '.join(VALID_DISCOVERED_IN_CONTEXTS)} "
-            "(optionally followed by '__<instance>')."
+            f"batch value {value!r} contains ':'. Use '-' / '__' separators only."
         )
 
 
 def validate_tags(tags: list[str]) -> None:
-    """Verify no tag contains a colon.
+    """Verify every tag is a `planning-<slug>` workstream-membership tag.
 
-    Tags are flat topic labels using `-` as the only separator. Colons
-    render as broken tag-pills in Obsidian. Domain/topic grouping belongs in
-    the `discovered-in` property (which uses `__`), not in tags.
+    Tags are a closed vocabulary: the only legal tag is `planning-<slug>`
+    (roadmap / workstream membership — the one facet no single-valued field
+    can express). Topic, discovered-in, and kind information lives in the
+    respective fields, not in tags.
 
     Raises:
-        ValidationError: When any tag contains ':'.
+        ValidationError: When any tag is not `planning-<non-empty-slug>`, or
+            contains ':'.
     """
-    bad = [t for t in tags if ":" in t]
+    bad = [
+        t
+        for t in tags
+        if ":" in t or not t.startswith("planning-") or t == "planning-"
+    ]
     if bad:
         raise ValidationError(
-            f"tags must not contain ':': {bad}. Tags use '-' only "
-            "(e.g. 'planning-nhs'); use the discovered-in property with '__' "
-            "for domain/topic grouping."
+            f"tags must be `planning-<slug>` (workstream membership only): {bad}. "
+            "Topic -> area/repo; how it surfaced -> discovered-in; "
+            "finding kind -> kind. Everything else is dropped."
         )
 
 
@@ -645,6 +718,13 @@ def validate_code_paths(config: Config, paths: list[str]) -> None:
     Raises:
         ValidationError: When any path's file portion is missing.
     """
+    if config.repo_root is None:
+        if paths:
+            raise ValidationError(
+                "related-code cannot be validated: no repo checkout resolved "
+                "(run inside the owning repo, or omit --code)."
+            )
+        return
     for path_spec in paths:
         # Strip optional ::symbol suffix.
         file_part = path_spec.split("::")[0]
@@ -713,6 +793,7 @@ class NewNoteSpec:
 
     note_type: NoteType
     title: str
+    repo: str | None
     area: str | None
     severity: Severity | None
     kind: str | None
@@ -727,6 +808,8 @@ class NewNoteSpec:
     sources: list[str]
     blocking: bool | None
     discovered_in: str | None
+    batch: str | None
+    forward: bool
 
 
 def _yaml_list(items: list[str]) -> str:
@@ -773,8 +856,23 @@ def render_frontmatter(spec: NewNoteSpec, today: date) -> str:
     lines.append(f"created: {today.isoformat()}")
     lines.append(f"updated: {today.isoformat()}")
 
+    if spec.repo is not None:
+        lines.append(f"repo: {spec.repo}")
+
     if spec.area is not None:
         lines.append(f"area: {spec.area}")
+
+    # Per-type extensions.
+    if spec.note_type == "finding":
+        lines.append(f"severity: {spec.severity}")
+        lines.append(f"kind: {spec.kind}")
+        if spec.discovered_in is not None:
+            lines.append(f"discovered-in: {spec.discovered_in}")
+        if spec.batch is not None:
+            lines.append(f"batch: {spec.batch}")
+
+    if spec.forward:
+        lines.append("forward: true")
 
     if spec.tags:
         lines.append(f"tags:{_yaml_list(spec.tags)}")
@@ -782,14 +880,10 @@ def render_frontmatter(spec: NewNoteSpec, today: date) -> str:
     if spec.related_notes:
         lines.append(f"related-notes:{_yaml_list(spec.related_notes)}")
 
-    # Per-type extensions.
+    # Remaining per-type extensions.
     if spec.note_type == "finding":
-        lines.append(f"severity: {spec.severity}")
-        lines.append(f"kind: {spec.kind}")
         if spec.related_code:
             lines.append(f"related-code:{_yaml_list(spec.related_code)}")
-        if spec.discovered_in is not None:
-            lines.append(f"discovered-in: {spec.discovered_in}")
 
     elif spec.note_type == "feature":
         if spec.priority is not None:
@@ -937,12 +1031,18 @@ def cmd_new(config: Config, spec: NewNoteSpec, no_open: bool = False) -> Path:
         )
 
     # Step 3: Cross-reference validation.
+    if spec.repo is None:
+        raise ValidationError(
+            "repo is unresolved: cannot create a note without a repo binding. "
+            "Add .claude/note.json to this repo, or pass --repo <name>."
+        )
     if spec.area is None:
         raise ValidationError(
             "field=area is required. Use --area with one of: "
             f"{', '.join(config.valid_areas)}"
         )
     validate_area(spec.area, config.valid_areas)
+    validate_batch(spec.batch)
     validate_tags(spec.tags)
     validate_code_paths(config, spec.related_code)
     validate_wikilinks(config, spec.related_notes)
@@ -1203,10 +1303,10 @@ def cmd_set(config: Config, slug: str, field: str, value: list[str]) -> None:
     """
     preflight(config)
 
-    if field == "type":
+    if field in ("type", "repo"):
         raise ValidationError(
-            "field=type cannot be changed via the set command. "
-            "Use migrate if it ever exists."
+            f"field={field} is immutable provenance and cannot be changed via "
+            "set (repo is stamped at creation; type would require a folder move)."
         )
 
     vault_path = resolve_slug(config, slug)
@@ -1249,7 +1349,19 @@ def cmd_set(config: Config, slug: str, field: str, value: list[str]) -> None:
         validate_status(note_type, scalar_value)
 
     elif field == "area":
-        validate_area(scalar_value, config.valid_areas)
+        # Validate against the NOTE's own repo's area list (may differ from the
+        # current checkout's repo in a shared vault).
+        note_repo = _read_note_property(config, vault_path, "repo")
+        repo_areas = config.repos_map.get(note_repo)
+        if repo_areas is None:
+            raise ValidationError(
+                f"Note at {vault_path} has repo {note_repo!r} not in the vault "
+                f"registry. Admitted repos: {', '.join(sorted(config.repos_map))}."
+            )
+        validate_area(scalar_value, repo_areas)
+
+    elif field == "batch":
+        validate_batch(scalar_value)
 
     elif field == "severity":
         if scalar_value not in VALID_SEVERITIES:
@@ -1273,7 +1385,7 @@ def cmd_set(config: Config, slug: str, field: str, value: list[str]) -> None:
 
     # Determine property type for CLI.
     date_fields = {"created", "updated", "sprint-end", "decided-on"}
-    bool_fields = {"blocking"}
+    bool_fields = {"blocking", "forward"}
     prop_type = "text"
     if field in date_fields:
         prop_type = "date"
@@ -1340,11 +1452,14 @@ class NoteSummary:
     path: Path
     note_type: NoteType
     status: str
+    repo: str | None
     area: str | None
     title: str
     severity: Severity | None
     kind: str | None
     discovered_in: str | None
+    batch: str | None
+    forward: bool
     priority: Priority | None
     created: date
     updated: date
@@ -1463,9 +1578,24 @@ def _read_note_summary_from_fs(vault_path: Path, file_path: Path) -> NoteSummary
     note_type: NoteType = note_type_str  # type: ignore[assignment]
 
     status_val = fm.get("status", "")
+
+    repo_val = fm.get("repo")
+    if repo_val == "" or repo_val is None:
+        repo_val = None
+    else:
+        repo_val = str(repo_val)
+
     area_val = fm.get("area")
     if area_val == "" or area_val is None:
         area_val = None
+
+    batch_val = fm.get("batch")
+    if batch_val == "" or batch_val is None:
+        batch_val = None
+    else:
+        batch_val = str(batch_val)
+
+    forward_val = bool(fm.get("forward", False))
 
     severity_val = fm.get("severity")
     if severity_val not in VALID_SEVERITIES:
@@ -1515,11 +1645,14 @@ def _read_note_summary_from_fs(vault_path: Path, file_path: Path) -> NoteSummary
         path=vault_relpath,
         note_type=note_type,
         status=status_val,
+        repo=repo_val,
         area=area_val,
         title=title,
         severity=severity_val,  # type: ignore[arg-type]
         kind=kind_val,
         discovered_in=discovered_in_val,
+        batch=batch_val,
+        forward=forward_val,
         priority=priority_val,  # type: ignore[arg-type]
         created=created_date,
         updated=updated_date,
@@ -1552,6 +1685,8 @@ def cmd_list(
     tags: list[str] | None,
     kind: str | None,
     discovered_in: str | None,
+    repo: str | None = None,
+    forward: bool = False,
 ) -> list[NoteSummary]:
     """List notes by filter using filesystem scanning.
 
@@ -1643,6 +1778,14 @@ def cmd_list(
 
             # Apply discovered-in filter (findings).
             if discovered_in is not None and summary.discovered_in != discovered_in:
+                continue
+
+            # Apply repo filter.
+            if repo is not None and summary.repo != repo:
+                continue
+
+            # Apply forward filter.
+            if forward and not summary.forward:
                 continue
 
             summaries.append(summary)
@@ -1752,6 +1895,7 @@ def cmd_check(config: Config) -> None:
     preflight(config)
     print(f"vault:        {config.vault}")
     print(f"vault_path:   {config.vault_path}")
+    print(f"repo:         {config.repo}")
     print(f"repo_root:    {config.repo_root}")
     print(f"obsidian_cli: {config.obsidian_cli}")
     print("OK")
@@ -1794,21 +1938,21 @@ def cmd_lint(config: Config) -> int:
     """Validate every note's frontmatter against the controlled schema.
 
     Checks per note:
-        - `area` is set and in the vault-sourced vocabulary (`config.valid_areas`).
+        - `repo` is set and admitted to the vault (`config.repos_map`).
+        - `area` is set and in the note's OWN repo's area list.
         - `status` is set (except retros) and valid for the note's type.
-        - `severity` is set and valid for findings.
-        - `kind` is set and valid for findings.
-        - `discovered-in`, if set on a finding, has a valid context prefix.
+        - `severity` / `kind` set and valid for findings.
+        - `discovered-in` is set on findings and is a valid context.
+        - `tags` are all `planning-<slug>` (closed vocabulary).
         - `related-notes` wikilinks resolve to existing vault notes.
 
-    `related-code` is intentionally NOT checked. It points outside the vault at
-    code that legitimately moves, renames, and is deleted over a note's lifetime
-    (notes are historical records), and in a shared multi-repo vault a path is
-    only resolvable from its own checkout. Existence is still validated at write
-    time (note creation / `set`) against the local repo. `priority` is also not
-    checked — features may be untriaged.
-    Body content is not scanned (prose slug-mentions would false-positive
-    on English phrases).
+    `related-code` is intentionally NOT checked: notes are historical records
+    and the code they point at legitimately moves, renames, and is deleted over
+    a note's lifetime (a missing path is normal, not an error), and in a shared
+    multi-repo vault a path only resolves from its own checkout. Existence is
+    still validated at write time (`new` / `set`) against the local repo.
+    `priority` is not checked (features may be untriaged). Body content is not
+    scanned (prose slug-mentions would false-positive).
 
     Args:
         config: Skill configuration.
@@ -1832,12 +1976,25 @@ def cmd_lint(config: Config) -> int:
             errors.append(f"{relpath}: type={note_type!r} is not a valid type")
             continue
 
+        note_repo = fm.get("repo")
+        repo_areas: tuple[str, ...] | None = None
+        if note_repo is None or note_repo == "":
+            errors.append(f"{relpath}: repo is missing")
+        elif note_repo not in config.repos_map:
+            errors.append(
+                f"{relpath}: repo={note_repo!r} not admitted "
+                f"(known: {sorted(config.repos_map)})"
+            )
+        else:
+            repo_areas = config.repos_map[note_repo]
+
         area = fm.get("area")
         if area is None or area == "":
             errors.append(f"{relpath}: area is missing")
-        elif area not in config.valid_areas:
+        elif repo_areas is not None and area not in repo_areas:
             errors.append(
-                f"{relpath}: area={area!r} not in {sorted(config.valid_areas)}"
+                f"{relpath}: area={area!r} not in repo {note_repo!r} areas "
+                f"{sorted(repo_areas)}"
             )
 
         if note_type != "retro":
@@ -1868,7 +2025,9 @@ def cmd_lint(config: Config) -> int:
                 errors.append(f"{relpath}: kind={kind!r} not in {list(VALID_KINDS)}")
 
             di = fm.get("discovered-in")
-            if di is not None and di != "":
+            if di is None or di == "":
+                errors.append(f"{relpath}: discovered-in is required for findings")
+            else:
                 try:
                     validate_discovered_in(str(di))
                 except ValidationError as exc:
@@ -1912,8 +2071,12 @@ def _format_summaries_text(summaries: list[NoteSummary]) -> str:
         parts = [f"{s.note_type}/{s.slug}"]
         if s.status:
             parts.append(f"[{s.status}]")
+        if s.repo:
+            parts.append(f"repo={s.repo}")
         if s.area:
             parts.append(f"area={s.area}")
+        if s.forward:
+            parts.append("forward")
         if s.severity:
             parts.append(f"severity={s.severity}")
         if s.kind:
@@ -1937,11 +2100,14 @@ def _format_summaries_json(summaries: list[NoteSummary]) -> str:
                 "path": str(s.path),
                 "type": s.note_type,
                 "status": s.status,
+                "repo": s.repo,
                 "area": s.area,
                 "title": s.title,
                 "severity": s.severity,
                 "kind": s.kind,
                 "discovered-in": s.discovered_in,
+                "batch": s.batch,
+                "forward": s.forward,
                 "priority": s.priority,
                 "created": s.created.isoformat(),
                 "updated": s.updated.isoformat(),
@@ -1974,6 +2140,15 @@ def main(argv: list[str] | None) -> int:
     parser = argparse.ArgumentParser(
         description="note skill — Obsidian-backed tracker",
         prog="cli.py",
+    )
+    parser.add_argument(
+        "--vault", help="Override the vault name (else NOTE_VAULT / repo binding)"
+    )
+    parser.add_argument(
+        "--vault-path", help="Override the vault path (bypasses the machine registry)"
+    )
+    parser.add_argument(
+        "--repo", help="Override the repo name (else the repo binding)"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -2016,7 +2191,16 @@ def main(argv: list[str] | None) -> int:
     )
     new_parser.add_argument(
         "--discovered-in",
-        help="Where it surfaced, <context>[__<instance>] (required for findings)",
+        choices=list(VALID_DISCOVERED_IN_CONTEXTS),
+        help="How it surfaced (context; required for findings)",
+    )
+    new_parser.add_argument(
+        "--batch", help="Free grouping slug for a finding (e.g. sprint/round/topic)"
+    )
+    new_parser.add_argument(
+        "--forward",
+        action="store_true",
+        help="Mark as a forward note (resolves when its area ships)",
     )
     new_parser.add_argument(
         "--no-open", action="store_true", help="Skip opening in GUI"
@@ -2054,7 +2238,11 @@ def main(argv: list[str] | None) -> int:
         "--kind", choices=list(VALID_KINDS), help="Filter findings by kind"
     )
     list_parser.add_argument(
-        "--discovered-in", help="Filter findings by discovered-in slug"
+        "--discovered-in", help="Filter findings by discovered-in context"
+    )
+    list_parser.add_argument("--repo", dest="list_repo", help="Filter by repo")
+    list_parser.add_argument(
+        "--forward", action="store_true", help="Only forward notes"
     )
     list_parser.add_argument("--format", choices=["text", "json"], default="text")
 
@@ -2094,7 +2282,11 @@ def main(argv: list[str] | None) -> int:
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     try:
-        config = load_config()
+        config = load_config(
+            vault_override=args.vault,
+            vault_path_override=args.vault_path,
+            repo_override=args.repo,
+        )
 
         if args.command == "new":
             sprint_end: date | None = None
@@ -2112,6 +2304,7 @@ def main(argv: list[str] | None) -> int:
             spec = NewNoteSpec(
                 note_type=args.type,  # type: ignore[arg-type]
                 title=args.title,
+                repo=config.repo,
                 area=args.area,
                 severity=args.severity,  # type: ignore[arg-type]
                 kind=args.kind,
@@ -2126,6 +2319,8 @@ def main(argv: list[str] | None) -> int:
                 sources=args.sources or [],
                 blocking=blocking,
                 discovered_in=args.discovered_in,
+                batch=args.batch,
+                forward=args.forward,
             )
             vault_relpath = cmd_new(config, spec, no_open=args.no_open)
             print(f"Created {vault_relpath}")
@@ -2149,6 +2344,8 @@ def main(argv: list[str] | None) -> int:
                 tags=args.tags,
                 kind=args.kind,
                 discovered_in=args.discovered_in,
+                repo=args.list_repo,
+                forward=args.forward,
             )
             if args.format == "json":
                 print(_format_summaries_json(summaries))
