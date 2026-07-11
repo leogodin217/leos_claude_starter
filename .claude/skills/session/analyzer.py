@@ -318,6 +318,7 @@ def extract_session_stats(path, verbose=False):
         "total_output_tokens": 0,
         "total_cache_read": 0,
         "total_cache_create": 0,
+        "tokens_by_model": defaultdict(lambda: {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}),
         "model": "",
         "version": "",
         "command": "",
@@ -358,15 +359,26 @@ def extract_session_stats(path, verbose=False):
         role = get_role(msg)
         content = inner.get("content", [])
 
-        if not stats["model"] and inner.get("model"):
-            stats["model"] = inner["model"]
+        msg_model = inner.get("model", "")
+        if not stats["model"] and msg_model:
+            stats["model"] = msg_model
 
         usage = inner.get("usage", {})
         if usage:
-            stats["total_input_tokens"] += usage.get("input_tokens", 0)
-            stats["total_output_tokens"] += usage.get("output_tokens", 0)
-            stats["total_cache_read"] += usage.get("cache_read_input_tokens", 0)
-            stats["total_cache_create"] += usage.get("cache_creation_input_tokens", 0)
+            inp = usage.get("input_tokens", 0)
+            out = usage.get("output_tokens", 0)
+            cr = usage.get("cache_read_input_tokens", 0)
+            cc = usage.get("cache_creation_input_tokens", 0)
+            stats["total_input_tokens"] += inp
+            stats["total_output_tokens"] += out
+            stats["total_cache_read"] += cr
+            stats["total_cache_create"] += cc
+            if msg_model:
+                bucket = stats["tokens_by_model"][msg_model]
+                bucket["input"] += inp
+                bucket["output"] += out
+                bucket["cache_read"] += cr
+                bucket["cache_create"] += cc
 
         if role == "assistant":
             for tu in extract_tool_uses(content):
@@ -447,6 +459,17 @@ def print_summary(stats):
     print(f"  Output:       {stats['total_output_tokens']:>10,}")
     print(f"  Cache read:   {stats['total_cache_read']:>10,}")
     print(f"  Cache create: {stats['total_cache_create']:>10,}")
+
+    by_model = stats.get("tokens_by_model", {})
+    if len(by_model) > 1:
+        print(f"\n--- Tokens by model ---")
+        for model_name in sorted(by_model):
+            b = by_model[model_name]
+            print(f"  {model_name}:")
+            print(f"    Input:        {b['input']:>10,}")
+            print(f"    Output:       {b['output']:>10,}")
+            print(f"    Cache read:   {b['cache_read']:>10,}")
+            print(f"    Cache create: {b['cache_create']:>10,}")
 
     total_tool_calls = sum(stats["tool_counts"].values())
     print(f"\n--- Tools ({total_tool_calls} calls) ---")
@@ -668,6 +691,16 @@ def cmd_summary(args):
     agg_cache_create = stats["total_cache_create"] + sum(s["total_cache_create"] for s in subagent_stats_list)
     agg_tools = sum(stats["tool_counts"].values()) + sum(sum(s["tool_counts"].values()) for s in subagent_stats_list)
 
+    # Aggregated tokens by model
+    agg_by_model = defaultdict(lambda: {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0})
+    for src in [stats] + subagent_stats_list:
+        for model_name, bucket in src.get("tokens_by_model", {}).items():
+            agg = agg_by_model[model_name]
+            agg["input"] += bucket["input"]
+            agg["output"] += bucket["output"]
+            agg["cache_read"] += bucket["cache_read"]
+            agg["cache_create"] += bucket["cache_create"]
+
     # Combined tool counts
     combined_tools = defaultdict(int, stats["tool_counts"])
     for s in subagent_stats_list:
@@ -693,20 +726,31 @@ def cmd_summary(args):
     print(f"  Cache read:   {agg_cache_read:>10,}")
     print(f"  Cache create: {agg_cache_create:>10,}")
 
+    if len(agg_by_model) > 1:
+        print(f"\n--- Aggregated tokens by model ---")
+        for model_name in sorted(agg_by_model):
+            b = agg_by_model[model_name]
+            print(f"  {model_name}:")
+            print(f"    Input:        {b['input']:>10,}")
+            print(f"    Output:       {b['output']:>10,}")
+            print(f"    Cache read:   {b['cache_read']:>10,}")
+            print(f"    Cache create: {b['cache_create']:>10,}")
+
     print(f"\n--- Aggregated tools ({agg_tools} calls) ---")
     for name in sorted(combined_tools, key=lambda n: combined_tools[n], reverse=True):
         print(f"  {name:<25} {combined_tools[name]:>4}x")
 
     print(f"\n--- Per-subagent breakdown ---")
-    print(f"  {'#':<4} {'Duration':<12} {'Tools':>6} {'In tokens':>12} {'Out tokens':>12} {'Size':>10}  {'File'}")
-    print(f"  {'─'*4} {'─'*12} {'─'*6} {'─'*12} {'─'*12} {'─'*10}  {'─'*30}")
+    print(f"  {'#':<4} {'Model':<28} {'Duration':<12} {'Tools':>6} {'In tokens':>12} {'Out tokens':>12} {'Size':>10}  {'File'}")
+    print(f"  {'─'*4} {'─'*28} {'─'*12} {'─'*6} {'─'*12} {'─'*12} {'─'*10}  {'─'*30}")
     for i, s in enumerate(subagent_stats_list):
         dur = ""
         if s["timestamps"]:
             dur = format_duration((max(s["timestamps"]) - min(s["timestamps"])).total_seconds())
         tc = sum(s["tool_counts"].values())
         name = Path(s["path"]).stem[:30]
-        print(f"  {i:<4} {dur:<12} {tc:>6} {s['total_input_tokens']:>12,} {s['total_output_tokens']:>12,} {format_bytes(s['file_size']):>10}  {name}")
+        model_short = s.get("model", "?") or "?"
+        print(f"  {i:<4} {model_short:<28} {dur:<12} {tc:>6} {s['total_input_tokens']:>12,} {s['total_output_tokens']:>12,} {format_bytes(s['file_size']):>10}  {name}")
 
     print(f"\n{'=' * 70}")
 
