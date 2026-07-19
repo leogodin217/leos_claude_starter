@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Spawn and drive named, remote-controllable claude sessions in detached tmux
+# panes. Sessions survive the operator session that spawned them (tmux server
+# process) and are reachable directly from claude.ai (/remote-control).
+set -euo pipefail
+
+usage() {
+    cat >&2 <<'EOF'
+usage: rsession <command> [args]
+
+  spawn <name> <dir> [prompt...]  start claude in <dir>, register /remote-control <name>,
+                                  print the claude.ai URL, then send [prompt] if given
+  peek  <name> [lines]            show the session's screen (lines = scrollback depth)
+  send  <name> <text...>          type text into the session and press Enter
+  ls                              list rsession/remote-claude tmux sessions
+  kill  <name>                    kill the session
+
+Sessions are named claude-<name>. If <dir>/.claude/*-system-prompt.md exists,
+it is passed as --system-prompt-file (repo convention); otherwise plain claude.
+EOF
+    exit 1
+}
+
+[ $# -ge 1 ] || usage
+cmd="$1"
+shift
+
+pane() { tmux capture-pane -pt "claude-$1" ${2:+-S "-$2"}; }
+
+case "$cmd" in
+spawn)
+    [ $# -ge 2 ] || usage
+    name="$1"
+    dir="$(cd "$2" && pwd)"
+    shift 2
+    session="claude-$name"
+    if tmux has-session -t "=$session" 2>/dev/null; then
+        echo "error: session $session already exists (rsession peek $name, or kill it first)" >&2
+        exit 1
+    fi
+    claude_bin="$(command -v claude)"
+    sysprompt=""
+    for f in "$dir"/.claude/*-system-prompt.md; do
+        [ -e "$f" ] && sysprompt="$f" && break
+    done
+    if [ -n "$sysprompt" ]; then
+        tmux new-session -d -s "$session" -c "$dir" -x 200 -y 50 \
+            "$claude_bin" --dangerously-skip-permissions --system-prompt-file "$sysprompt"
+    else
+        tmux new-session -d -s "$session" -c "$dir" -x 200 -y 50 \
+            "$claude_bin" --dangerously-skip-permissions
+    fi
+    tmux set-window-option -t "$session" remain-on-exit on
+
+    # Wait for the TUI to be ready; answer the first-run folder-trust prompt
+    # (spawning here deliberately implies trusting the target directory)
+    ready=0
+    for _ in $(seq 1 30); do
+        sleep 1
+        if pane "$name" | grep -q "trust this folder"; then
+            tmux send-keys -t "$session" Enter
+            continue
+        fi
+        pane "$name" | grep -q "bypass permissions" && { ready=1; break; }
+    done
+    if [ "$ready" -ne 1 ]; then
+        echo "error: claude TUI not ready after 30s; inspect with: rsession peek $name" >&2
+        exit 1
+    fi
+
+    # Register for remote control and capture the claude.ai URL
+    tmux send-keys -t "$session" -l -- "/remote-control $name"
+    sleep 0.5
+    tmux send-keys -t "$session" Enter
+    url=""
+    for _ in $(seq 1 30); do
+        sleep 1
+        url="$(pane "$name" | grep -o 'https://claude\.ai/code/[A-Za-z0-9_]*' | tail -1)" && [ -n "$url" ] && break
+    done
+
+    echo "spawned $session in $dir"
+    if [ -n "$url" ]; then
+        echo "  remote-control: $url"
+    else
+        echo "  WARNING: /remote-control URL not detected — inspect with: rsession peek $name" >&2
+    fi
+
+    if [ $# -ge 1 ]; then
+        tmux send-keys -t "$session" -l -- "$*"
+        sleep 0.5
+        tmux send-keys -t "$session" Enter
+        echo "  sent: $*"
+    fi
+    echo "  peek: rsession peek $name    send: rsession send $name <text>"
+    ;;
+peek)
+    [ $# -ge 1 ] || usage
+    pane "$1" "${2:-}"
+    ;;
+send)
+    [ $# -ge 2 ] || usage
+    name="$1"
+    shift
+    tmux send-keys -t "claude-$name" -l -- "$*"
+    sleep 0.5
+    tmux send-keys -t "claude-$name" Enter
+    ;;
+ls)
+    tmux list-sessions -F '#{session_name}: #{session_path}' 2>/dev/null \
+        | grep '^claude-' || echo "no claude tmux sessions"
+    ;;
+kill)
+    [ $# -ge 1 ] || usage
+    tmux kill-session -t "=claude-$1"
+    ;;
+*)
+    usage
+    ;;
+esac
