@@ -1,13 +1,13 @@
 ---
 name: note
-description: Obsidian vault-backed tracker for findings, features, questions, retros, decisions, and research. Use to record or query a finding (including confirmed bugs), feature, or open question instead of GitHub issues.
+description: Obsidian vault-backed tracker for findings, features, questions, retros, decisions, research, and plans. Use to record or query a finding (including confirmed bugs), feature, open question, or cross-repo plan instead of GitHub issues.
 argument-hint: "[command] [args]"
 allowed-tools: Bash(python3 ~/.claude/skills/note/cli.py *)
 ---
 
 # Note
 
-Vault-backed tracker for findings, features, questions, retros, decisions, and research. All operations route through `python3 ~/.claude/skills/note/cli.py`, which wraps the Obsidian CLI. The vault is **outside the repo** (OneDrive-synced).
+Vault-backed tracker for findings, features, questions, retros, decisions, research, and plans. All operations route through `python3 ~/.claude/skills/note/cli.py`, which wraps the Obsidian CLI. The vault is **outside the repo** (Obsidian Sync).
 
 The skill is installed once at `~/.claude/skills/note` (a symlink into this starter repo) and is shared by every repo pointed at the same vault. One shared vault can serve several related repos; each note is stamped with the `repo` it was created in.
 
@@ -30,7 +30,7 @@ Machine registry `~/.config/note.json`:
 ```json
 {
   "obsidian_cli": "/mnt/c/Users/<user>/AppData/Local/Programs/Obsidian/Obsidian.com",
-  "vaults": { "Fabulexa": "/mnt/c/Users/<user>/OneDrive/vaults/Fabulexa" }
+  "vaults": { "Fabulexa": "/mnt/c/Users/<user>/obsidian/Fabulexa" }
 }
 ```
 
@@ -54,6 +54,7 @@ Machine registry `~/.config/note.json`:
 ├── retros/          # type: retro
 ├── decisions/       # type: decision
 ├── research/        # type: research
+├── plans/           # type: plan
 ├── MOCs/            # Bases views — Open Findings, Roadmap, Critical, etc.
 └── _templates/      # one per type
 ```
@@ -66,12 +67,12 @@ Filenames: slug only, lowercase, hyphenated (e.g., `state-store-resume-bug.md`).
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `type` | enum | yes | `finding \| feature \| question \| retro \| decision \| research` — controlled, immutable |
+| `type` | enum | yes | `finding \| feature \| question \| retro \| decision \| research \| plan` — controlled, immutable |
 | `status` | enum | yes | values per-type, see below |
 | `created` | date | yes | ISO date, auto-set on creation |
 | `updated` | date | yes | ISO date, auto-maintained on every write |
-| `repo` | enum | yes | which repo owns the note. **Stamped from the binding at creation, never author-typed, immutable.** A key in the vault `repos:` map. |
-| `area` | enum | yes | sub-package **within `repo`**, validated against that repo's list in `meta/note-areas.md`. `cross-cutting` = cross-package within one repo. |
+| `repo` | enum | yes | which repo owns the note. **Stamped from the binding at creation, never author-typed, immutable.** A key in the vault `repos:` map. Plans additionally carry a `repos` list (see below) — the scalar `repo` is unchanged and still stamped/immutable. |
+| `area` | enum | yes* | sub-package **within `repo`**, validated against that repo's list in `meta/note-areas.md`. `cross-cutting` = cross-package within one repo. *Not valid on `plan` — plans have no `area` (they coordinate `repos` instead). |
 | `forward` | bool | no | `true` marks a forward note (resolves when its area ships). Filter with `list --forward`. |
 | `tags` | list | no | **closed vocabulary: only `planning-<slug>`** (workstream/roadmap membership). Every other tag is rejected. |
 | `related-notes` | list | no | wikilinks: `"[[other-note]]"` (resolve vault-wide, so cross-repo links are legal) |
@@ -86,6 +87,7 @@ Filenames: slug only, lowercase, hyphenated (e.g., `state-store-resume-bug.md`).
 | `retro` | (no status) | `sprint` (req, repo path), `sprint-end` (req, date) |
 | `decision` | `active \| superseded` | `decided-on` (req, date), `alternatives` (text), `supersedes` (wikilink) |
 | `research` | `in-progress \| complete \| abandoned` | `sources` (URL list), `conclusion` (text) |
+| `plan` | `active \| complete \| wont-do` | `repos` (req, list of registered repos — the repos this plan coordinates, author order preserved). No `area`. |
 
 **`discovered-in` + `batch` (findings).** `discovered-in` is a controlled *context* — how the finding surfaced: `qa \| code-review \| arch-design \| arch-review \| planning \| other`. `batch` is a free grouping slug (sprint / round / topic, e.g. `snapshot-resume`, `nhs-perf`). They were one composite `context__instance` field; now split so each half is queryable.
 
@@ -93,16 +95,17 @@ Filenames: slug only, lowercase, hyphenated (e.g., `state-store-resume-bug.md`).
 
 ## Validation Rules
 
-1. **`type` must be one of the six controlled values.** Immutable — `set type` and `set repo` are rejected (both are provenance; `type` would need a folder move).
+1. **`type` must be one of the seven controlled values.** Immutable — `set type` and `set repo` are rejected (both are provenance; `type` would need a folder move).
 2. **`status` must be valid for the note's `type`.** Reject otherwise.
 3. **`repo` is stamped from the binding, not author-supplied.** It must be a key in the vault `repos:` map (else REPO-UNREGISTERED at config time). Immutable after creation.
-4. **`area` is required and must be in the note's `repo` area list.** No default. `cross-cutting` means cross-package within one repo. `lint` validates each note's area against *its own* repo's list.
-5. **`severity`, `kind`, and `discovered-in` are required at creation for findings.** `severity` is urgency (`critical \| warning \| trivial`); `kind` is what the finding is (`bug` = code wrong; `nit` = cleanliness; `gap` = missing coverage/docs; `design` = architectural/process); orthogonal. `discovered-in` must be a controlled context (`qa \| code-review \| arch-design \| arch-review \| planning \| other`) — validated at write **and** by `lint`. Put any grouping slug in `batch` (free; no `:`).
-6. **`tags` are a closed vocabulary — only `planning-<slug>`.** Any other tag is rejected at write and by `lint`. Topic → `area`/`repo`; how it surfaced → `discovered-in`; finding kind → `kind`.
-7. **`priority` is optional at creation for features**, set during triage.
-8. **`related-code` paths must exist under the checkout at write time** (file portion, ignoring `::symbol`). Reject on missing path at creation / `set`. **Not checked by `lint`**: notes are historical records and the code they point at legitimately moves; in a shared multi-repo vault a path only resolves from its own checkout.
-9. **`related-notes` wikilinks must resolve to existing vault notes** (vault-wide, so cross-repo links are legal). Reject on missing target.
-10. **Filename slugs must be unique within their folder.** Disambiguate with `-2`, `-3` suffix on collision.
+4. **`area` is required and must be in the note's `repo` area list — except for `plan`, which has no `area`.** No default. `cross-cutting` means cross-package within one repo. `lint` validates each note's area against *its own* repo's list; a `plan` that has an `area` set is a lint error.
+5. **`repos` is required (>=1 entry) for `plan`, rejected for every other type.** Each entry must be a key in the vault `repos:` map (else the error names `meta/note-areas.md`); duplicates are rejected. Author order is preserved — not sorted, not deduped. Mutable via `set <slug> repos a b c` (full-replacement, re-validated) since a plan's span may grow.
+6. **`severity`, `kind`, and `discovered-in` are required at creation for findings.** `severity` is urgency (`critical \| warning \| trivial`); `kind` is what the finding is (`bug` = code wrong; `nit` = cleanliness; `gap` = missing coverage/docs; `design` = architectural/process); orthogonal. `discovered-in` must be a controlled context (`qa \| code-review \| arch-design \| arch-review \| planning \| other`) — validated at write **and** by `lint`. Put any grouping slug in `batch` (free; no `:`).
+7. **`tags` are a closed vocabulary — only `planning-<slug>`.** Any other tag is rejected at write and by `lint`. Topic → `area`/`repo`; how it surfaced → `discovered-in`; finding kind → `kind`.
+8. **`priority` is optional at creation for features**, set during triage.
+9. **`related-code` paths must exist under the checkout at write time** (file portion, ignoring `::symbol`). Reject on missing path at creation / `set`. **Not checked by `lint`**: notes are historical records and the code they point at legitimately moves; in a shared multi-repo vault a path only resolves from its own checkout.
+10. **`related-notes` wikilinks must resolve to existing vault notes** (vault-wide, so cross-repo links are legal). Reject on missing target.
+11. **Filename slugs must be unique within their folder.** Disambiguate with `-2`, `-3` suffix on collision.
 
 ## Status Transition Behavior
 
@@ -145,7 +148,8 @@ python3 ~/.claude/skills/note/cli.py new finding "State store resume bug" \
 ```
 
 Options:
-- `--area <name>` (**required**, must be in this repo's area list)
+- `--area <name>` (**required for every type except `plan`**, must be in this repo's area list; **rejected** for `plan`)
+- `--repos <name> [<name> ...]` (**required for `plan`**, each a registered repo; **rejected** for every other type)
 - `--severity {critical|warning|trivial}` (required for findings)
 - `--kind {bug|nit|gap|design}` (required for findings)
 - `--discovered-in {qa|code-review|arch-design|arch-review|planning|other}` (**required for findings**)
@@ -179,9 +183,9 @@ Update a single frontmatter field. Validates if the field is controlled (`status
 python3 ~/.claude/skills/note/cli.py set state-store-resume-bug priority p0
 ```
 
-**Scalar fields** require exactly one value and are written via the Obsidian CLI so the running GUI arbitrates. `area` is validated against the note's *own* repo's area list. `forward` and `blocking` are boolean.
+**Scalar fields** require exactly one value and are written via the Obsidian CLI so the running GUI arbitrates. `area` is validated against the note's *own* repo's area list; rejected outright on `plan` notes (no `area`). `forward` and `blocking` are boolean.
 
-**List fields** (`tags`, `related-notes`, `related-code`, `depends-on`, `sources`) accept one or more values and **replace the existing list in full** (no append). Written via direct atomic filesystem rewrite. `tags` (must be `planning-*`), `related-notes`, and `related-code` are validated before write.
+**List fields** (`tags`, `related-notes`, `related-code`, `depends-on`, `sources`, `repos`) accept one or more values and **replace the existing list in full** (no append). Written via direct atomic filesystem rewrite. `tags` (must be `planning-*`), `related-notes`, `related-code`, and `repos` (only settable on `plan` notes, re-validated against the vault registry) are validated before write.
 
 ```
 python3 ~/.claude/skills/note/cli.py set my-finding related-notes "[[a]]" "[[b]]"
@@ -204,10 +208,10 @@ python3 ~/.claude/skills/note/cli.py list --needs-triage    # area is empty
 Options:
 - `--type <type>` — filter by type
 - `--status <status>` — filter by status (must be valid for filtered type). Pass `all` to list every status, including terminal ones.
-- `--repo <name>` — filter by owning repo
+- `--repo <name>` — filter by owning repo. Matches when the note's scalar `repo` equals the value **OR** the value appears in a `plan`'s `repos` list (one uniform OR rule; `repos` is empty on non-plan types, so their matching is unchanged).
 - `--area <name>` — filter by area
 - `--forward` — only forward notes
-- `--needs-triage` — notes with empty `area`
+- `--needs-triage` — notes with empty `area`. `plan` notes have no `area` by design and are excluded from this filter, not swept in as permanently untriaged.
 - `--tags planning-<slug> [...]` — require all listed tags (AND semantics)
 - `--kind {bug|nit|gap|design}` — filter findings by kind
 - `--discovered-in {qa|code-review|arch-design|arch-review|planning|other}` — filter findings by context

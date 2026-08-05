@@ -6,8 +6,8 @@ retros, decisions, research) in an Obsidian vault.
 Hybrid write model: new-note creation writes directly to the vault filesystem
 (no contention since the target file does not exist yet). Operations on
 existing notes (status flips, property sets, log appends) go through the
-Obsidian CLI so the running GUI arbitrates. OneDrive sync conflicts cannot
-occur between this skill and the Obsidian GUI for existing-file writes.
+Obsidian CLI so the running GUI arbitrates. Sync conflicts cannot occur
+between this skill and the Obsidian GUI for existing-file writes.
 
 See SKILL.md for the full behavioral contract.
 """
@@ -33,7 +33,9 @@ import yaml
 # Controlled vocabularies (validated at write time)
 # -----------------------------------------------------------------------------
 
-NoteType = Literal["finding", "feature", "question", "retro", "decision", "research"]
+NoteType = Literal[
+    "finding", "feature", "question", "retro", "decision", "research", "plan"
+]
 
 # The `area` vocabulary is NOT a `Literal` here — it is sourced at runtime from
 # `<vault_path>/meta/note-areas.md` (see `load_valid_areas`) so every repo
@@ -64,6 +66,7 @@ VALID_TYPES: tuple[str, ...] = (
     "retro",
     "decision",
     "research",
+    "plan",
 )
 
 # Per-type allowed status values. Skill rejects any value not in the type's set.
@@ -74,6 +77,7 @@ STATUS_BY_TYPE: dict[NoteType, tuple[str, ...]] = {
     "retro": (),  # retros have no status
     "decision": ("active", "superseded"),
     "research": ("in-progress", "complete", "abandoned"),
+    "plan": ("active", "complete", "wont-do"),
 }
 
 # Initial status per type (omitted for retro).
@@ -83,6 +87,7 @@ INITIAL_STATUS: dict[str, str] = {
     "question": "open",
     "decision": "active",
     "research": "in-progress",
+    "plan": "active",
 }
 
 # Non-terminal (active) statuses for default list filtering.
@@ -104,6 +109,7 @@ FOLDER_BY_TYPE: dict[NoteType, str] = {
     "retro": "retros",
     "decision": "decisions",
     "research": "research",
+    "plan": "plans",
 }
 
 
@@ -736,6 +742,41 @@ def validate_code_paths(config: Config, paths: list[str]) -> None:
             )
 
 
+def validate_repos(repos: list[str], repos_map: dict[str, tuple[str, ...]]) -> None:
+    """Verify every entry in a plan's `repos` list is a registered repo.
+
+    Args:
+        repos: Repo keys the plan coordinates, in author-given order.
+        repos_map: Vault registry loaded from meta/note-areas.md.
+
+    Raises:
+        ValidationError: When `repos` is empty, contains a duplicate, or names
+            a key absent from `repos_map`. Message must name meta/note-areas.md.
+    """
+    if not repos:
+        raise ValidationError(
+            "field=repos is required for type=plan and must name at least one "
+            "repo registered in meta/note-areas.md."
+        )
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for r in repos:
+        if r in seen:
+            duplicates.append(r)
+        seen.add(r)
+    if duplicates:
+        raise ValidationError(
+            f"field=repos contains duplicate(s) {duplicates}: {repos}. "
+            "Each repo must appear at most once."
+        )
+    unknown = [r for r in repos if r not in repos_map]
+    if unknown:
+        raise ValidationError(
+            f"field=repos names unregistered repo(s) {unknown}. "
+            f"Admitted repos (meta/note-areas.md): {', '.join(sorted(repos_map))}."
+        )
+
+
 def validate_wikilinks(config: Config, links: list[str]) -> None:
     """Verify each wikilink target resolves to an existing vault note.
 
@@ -789,6 +830,8 @@ class NewNoteSpec:
         blocking: Optional, questions only.
         discovered_in: Context where the finding surfaced. Required for
             findings, otherwise None.
+        repos: Repo keys a plan coordinates, in author-given order. Required
+            (non-empty) for plans; empty tuple for every other type.
     """
 
     note_type: NoteType
@@ -810,6 +853,7 @@ class NewNoteSpec:
     discovered_in: str | None
     batch: str | None
     forward: bool
+    repos: tuple[str, ...]
 
 
 def _yaml_list(items: list[str]) -> str:
@@ -906,6 +950,9 @@ def render_frontmatter(spec: NewNoteSpec, today: date) -> str:
         if spec.sources:
             lines.append(f"sources:{_yaml_list(spec.sources)}")
 
+    elif spec.note_type == "plan":
+        lines.append(f"repos:{_yaml_list(list(spec.repos))}")
+
     lines.append("---")
     return "\n".join(lines)
 
@@ -946,6 +993,19 @@ def render_body_template(spec: NewNoteSpec, today: date) -> str:
         lines += ["## Context", "", "## Decision", "", "## Alternatives", ""]
     elif spec.note_type == "research":
         lines += ["## Summary", "", "## Notes", ""]
+    elif spec.note_type == "plan":
+        lines += [
+            "## Context",
+            "",
+            "## Build order",
+            "",
+            "## Dependencies",
+            "",
+            "## Deferred",
+            "",
+            "## Alternatives rejected",
+            "",
+        ]
 
     if spec.body is not None:
         lines += [spec.body, ""]
@@ -1036,12 +1096,27 @@ def cmd_new(config: Config, spec: NewNoteSpec, no_open: bool = False) -> Path:
             "repo is unresolved: cannot create a note without a repo binding. "
             "Add .claude/note.json to this repo, or pass --repo <name>."
         )
-    if spec.area is None:
-        raise ValidationError(
-            "field=area is required. Use --area with one of: "
-            f"{', '.join(config.valid_areas)}"
-        )
-    validate_area(spec.area, config.valid_areas)
+
+    if spec.note_type == "plan":
+        if spec.area is not None:
+            raise ValidationError(
+                "field=area is not valid for type=plan (plans coordinate "
+                "repos, not a single area; omit --area)."
+            )
+        validate_repos(list(spec.repos), config.repos_map)
+    else:
+        if spec.area is None:
+            raise ValidationError(
+                "field=area is required. Use --area with one of: "
+                f"{', '.join(config.valid_areas)}"
+            )
+        validate_area(spec.area, config.valid_areas)
+        if spec.repos:
+            raise ValidationError(
+                f"field=repos is only valid for type=plan; "
+                f"type={spec.note_type!r} does not support it."
+            )
+
     validate_batch(spec.batch)
     validate_tags(spec.tags)
     validate_code_paths(config, spec.related_code)
@@ -1223,6 +1298,7 @@ LIST_FIELDS: frozenset[str] = frozenset(
         "related-code",
         "depends-on",
         "sources",
+        "repos",
     }
 )
 
@@ -1277,18 +1353,20 @@ def cmd_set(config: Config, slug: str, field: str, value: list[str]) -> None:
     CLI so the running GUI arbitrates.
 
     List fields (`tags`, `related-notes`, `related-code`, `depends-on`,
-    `sources`) accept one or more values and replace the existing list in
-    full. Written via direct filesystem rewrite with atomic rename.
+    `sources`, `repos`) accept one or more values and replace the existing
+    list in full. Written via direct filesystem rewrite with atomic rename.
 
     Validation:
         - `type` cannot be set via this command (raises ValidationError).
         - `status` revalidated against the note's current type.
-        - `area` validated against the controlled list.
+        - `area` validated against the controlled list; rejected outright on
+          plans (plans have no area).
         - `severity`, `kind`, `priority` validated against their controlled
           lists.
         - `discovered-in` context prefix validated.
         - `related-notes` validated via validate_wikilinks.
         - `related-code` validated via validate_code_paths.
+        - `repos` only settable on plans; validated via validate_repos.
 
     Args:
         config: Skill configuration.
@@ -1321,6 +1399,14 @@ def cmd_set(config: Config, slug: str, field: str, value: list[str]) -> None:
             validate_code_paths(config, value)
         elif field == "tags":
             validate_tags(value)
+        elif field == "repos":
+            note_type_str = _read_note_property(config, vault_path, "type")
+            if note_type_str != "plan":
+                raise ValidationError(
+                    f"field=repos is only valid for type=plan; note at "
+                    f"{vault_path} has type={note_type_str!r}."
+                )
+            validate_repos(value, config.repos_map)
 
         today = date.today()
 
@@ -1349,6 +1435,12 @@ def cmd_set(config: Config, slug: str, field: str, value: list[str]) -> None:
         validate_status(note_type, scalar_value)
 
     elif field == "area":
+        note_type_str = _read_note_property(config, vault_path, "type")
+        if note_type_str == "plan":
+            raise ValidationError(
+                f"field=area is not valid for type=plan (plan at {vault_path} "
+                "coordinates repos, not a single area)."
+            )
         # Validate against the NOTE's own repo's area list (may differ from the
         # current checkout's repo in a shared vault).
         note_repo = _read_note_property(config, vault_path, "repo")
@@ -1446,6 +1538,7 @@ class NoteSummary:
         created: Creation date.
         updated: Last-update date.
         tags: Free-form tags (empty list if unset).
+        repos: Repo keys a plan coordinates (empty tuple for non-plan types).
     """
 
     slug: str
@@ -1464,6 +1557,7 @@ class NoteSummary:
     created: date
     updated: date
     tags: tuple[str, ...]
+    repos: tuple[str, ...]
 
 
 def _parse_frontmatter(content: str) -> dict:
@@ -1640,6 +1734,11 @@ def _read_note_summary_from_fs(vault_path: Path, file_path: Path) -> NoteSummary
         tags_val = []
     tags_tuple = tuple(str(t) for t in tags_val)
 
+    repos_val = fm.get("repos") or []
+    if not isinstance(repos_val, list):
+        repos_val = []
+    repos_tuple = tuple(str(r) for r in repos_val)
+
     return NoteSummary(
         slug=slug,
         path=vault_relpath,
@@ -1657,6 +1756,7 @@ def _read_note_summary_from_fs(vault_path: Path, file_path: Path) -> NoteSummary
         created=created_date,
         updated=updated_date,
         tags=tags_tuple,
+        repos=repos_tuple,
     )
 
 
@@ -1694,10 +1794,14 @@ def cmd_list(
         - Default (no status filter): all notes with a non-terminal status
           (open, active, proposed, scheduled, in-progress).
         - `status="all"` disables the status filter entirely (every status).
-        - `needs_triage` selects notes whose `area` is empty.
+        - `needs_triage` selects notes whose `area` is empty. Plans have no
+          `area` by design and are excluded from `needs_triage`, not swept
+          in as permanently untriaged.
         - `tags` requires every listed tag to be present (AND semantics).
         - `kind` filters findings by their controlled kind value.
         - `discovered_in` filters findings by their `discovered-in` slug.
+        - `repo` matches a note whose scalar `repo` equals the filter OR
+          whose plan `repos` list contains it.
         - Filter combinations are AND.
         - Files with missing or unparseable frontmatter are silently skipped.
 
@@ -1707,10 +1811,13 @@ def cmd_list(
         status: Optional status filter. `"all"` lists every status; otherwise
             validated against type if both given.
         area: Optional area filter.
-        needs_triage: When True, restricts to notes missing `area`.
+        needs_triage: When True, restricts to notes missing `area` (plans
+            excluded).
         tags: Optional tag filter; all listed tags must be present.
         kind: Optional kind filter (findings).
         discovered_in: Optional `discovered-in` filter (findings).
+        repo: Optional repo filter; matches scalar `repo` or membership in
+            a plan's `repos` list.
 
     Returns:
         Notes matching all filters, sorted by (severity desc, priority asc,
@@ -1764,8 +1871,11 @@ def cmd_list(
             if area is not None and summary.area != area:
                 continue
 
-            # Apply needs_triage filter.
-            if needs_triage and summary.area is not None:
+            # Apply needs_triage filter. Plans have no `area` by design, so
+            # they never register as untriaged.
+            if needs_triage and (
+                summary.note_type == "plan" or summary.area is not None
+            ):
                 continue
 
             # Apply tags filter (AND semantics).
@@ -1780,8 +1890,9 @@ def cmd_list(
             if discovered_in is not None and summary.discovered_in != discovered_in:
                 continue
 
-            # Apply repo filter.
-            if repo is not None and summary.repo != repo:
+            # Apply repo filter: matches the scalar `repo` or membership in a
+            # plan's `repos` list.
+            if repo is not None and repo != summary.repo and repo not in summary.repos:
                 continue
 
             # Apply forward filter.
@@ -1939,12 +2050,15 @@ def cmd_lint(config: Config) -> int:
 
     Checks per note:
         - `repo` is set and admitted to the vault (`config.repos_map`).
-        - `area` is set and in the note's OWN repo's area list.
+        - `area` is set and in the note's OWN repo's area list. Plans are
+          exempt from this rule (they carry no `area`); a plan that HAS an
+          `area` is instead flagged as an error.
         - `status` is set (except retros) and valid for the note's type.
         - `severity` / `kind` set and valid for findings.
         - `discovered-in` is set on findings and is a valid context.
         - `tags` are all `planning-<slug>` (closed vocabulary).
         - `related-notes` wikilinks resolve to existing vault notes.
+        - `repos` is set and every entry is a registered repo, for plans.
 
     `related-code` is intentionally NOT checked: notes are historical records
     and the code they point at legitimately moves, renames, and is deleted over
@@ -1989,13 +2103,29 @@ def cmd_lint(config: Config) -> int:
             repo_areas = config.repos_map[note_repo]
 
         area = fm.get("area")
-        if area is None or area == "":
+        if note_type == "plan":
+            if area is not None and area != "":
+                errors.append(
+                    f"{relpath}: area={area!r} is set but type=plan does not "
+                    "support area (plans coordinate repos, not a single area)"
+                )
+        elif area is None or area == "":
             errors.append(f"{relpath}: area is missing")
         elif repo_areas is not None and area not in repo_areas:
             errors.append(
                 f"{relpath}: area={area!r} not in repo {note_repo!r} areas "
                 f"{sorted(repo_areas)}"
             )
+
+        if note_type == "plan":
+            repos_val = fm.get("repos") or []
+            if not isinstance(repos_val, list):
+                errors.append(f"{relpath}: repos must be a list")
+            else:
+                try:
+                    validate_repos([str(r) for r in repos_val], config.repos_map)
+                except ValidationError as exc:
+                    errors.append(f"{relpath}: {exc}")
 
         if note_type != "retro":
             status_val = fm.get("status")
@@ -2073,6 +2203,8 @@ def _format_summaries_text(summaries: list[NoteSummary]) -> str:
             parts.append(f"[{s.status}]")
         if s.repo:
             parts.append(f"repo={s.repo}")
+        if s.repos:
+            parts.append(f"repos={','.join(s.repos)}")
         if s.area:
             parts.append(f"area={s.area}")
         if s.forward:
@@ -2101,6 +2233,7 @@ def _format_summaries_json(summaries: list[NoteSummary]) -> str:
                 "type": s.note_type,
                 "status": s.status,
                 "repo": s.repo,
+                "repos": list(s.repos),
                 "area": s.area,
                 "title": s.title,
                 "severity": s.severity,
@@ -2171,8 +2304,14 @@ def main(argv: list[str] | None) -> int:
     )
     new_parser.add_argument(
         "--area",
-        required=True,
-        help="Package area (required; validated against the vault vocabulary)",
+        help="Package area (required for all types except plan; validated "
+        "against the vault vocabulary; plans do not take an area)",
+    )
+    new_parser.add_argument(
+        "--repos",
+        nargs="+",
+        help="Repo keys this plan coordinates (required for type=plan; "
+        "invalid for every other type)",
     )
     new_parser.add_argument(
         "--code", nargs="+", dest="related_code", help="Related code paths"
@@ -2321,6 +2460,7 @@ def main(argv: list[str] | None) -> int:
                 discovered_in=args.discovered_in,
                 batch=args.batch,
                 forward=args.forward,
+                repos=tuple(args.repos or []),
             )
             vault_relpath = cmd_new(config, spec, no_open=args.no_open)
             print(f"Created {vault_relpath}")
