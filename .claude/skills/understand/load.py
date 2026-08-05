@@ -20,6 +20,7 @@ Design constraints:
 
 from __future__ import annotations
 
+import glob
 import os
 import re
 import sys
@@ -28,13 +29,31 @@ HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 RANGE = re.compile(r"^(\d+)-(\d+)$")
 
 # Frontmatter keys describing the repo's shape rather than an area's reading
-# list. A bundle declaring one states a fact about where this repo keeps things,
-# so a skill can be written once and run against repos laid out differently.
-# Rendered with the bundle, and readable on its own via `--field` by skills whose
-# context posture forbids loading a whole bundle.
+# list. A bundle declaring one states a fact about this repo, so a skill can be
+# written once and run against repos built differently. Rendered with the bundle,
+# and readable on its own via `--field` by skills whose context posture forbids
+# loading a whole bundle.
+#
+# These are prompts, not programs: a skill "configured" by a shape key names both
+# branches in its own prose and keys them to the declared value. Adding a key here
+# is a commitment every adopting repo must keep true, so add one only when a skill
+# body would otherwise have to assume a layout.
 SHAPE_FIELDS = {
-    "subsystem-docs": "Per-subsystem architecture docs live at",
+    "subsystem-docs": "Per-subsystem architecture docs live under",
+    "layout": "This repository's layout is",
+    "packages": "Its package directories are",
+    "typecheck-hook": "Its repo-wide type-check pre-commit hook is named",
+    "output-judge-agent": "The agent that judges generated output is",
 }
+
+# Declared by every repo, because a shared skill body reads them unconditionally.
+# `packages` is required only under `layout: monorepo` — see check_shape.
+REQUIRED_SHAPE = ("subsystem-docs", "layout", "typecheck-hook", "output-judge-agent")
+
+LAYOUTS = ("monorepo", "single-package")
+
+# Frontmatter keys that are not repo-shape declarations.
+BUNDLE_FIELDS = ("name", "description", "context")
 
 
 def bundles_dir(project_dir: str) -> str:
@@ -237,6 +256,67 @@ def render_entry(project_dir: str, line: str) -> tuple[str, str]:
     return "\n\n".join(sections) + "\n", withheld
 
 
+def collect_shape(project_dir: str) -> tuple[dict[str, str], list[str]]:
+    """Gather shape keys across every bundle. Returns (values, errors).
+
+    A shape key is a repo-level fact, so declaring one twice is an error even
+    when the values agree — two places to keep true is the thing shape keys
+    exist to remove.
+    """
+    values: dict[str, str] = {}
+    seen: dict[str, str] = {}
+    errors: list[str] = []
+    for area in available_areas(project_dir):
+        path = os.path.join(bundles_dir(project_dir), f"{area}.md")
+        with open(path, encoding="utf-8") as handle:
+            meta, _ = parse_frontmatter(handle.read())
+        for key, value in meta.items():
+            if key in BUNDLE_FIELDS:
+                continue
+            if key not in SHAPE_FIELDS:
+                known = ", ".join(sorted(SHAPE_FIELDS))
+                errors.append(f"{area}: unknown frontmatter key {key!r} — known shape keys: {known}")
+                continue
+            if not isinstance(value, str) or not value:
+                errors.append(f"{area}: shape key {key!r} has no value")
+                continue
+            if key in seen:
+                errors.append(
+                    f"{area}: shape key {key!r} is already declared in {seen[key]!r} — declare it once"
+                )
+                continue
+            seen[key], values[key] = area, value
+    return values, errors
+
+
+def check_shape(project_dir: str) -> list[str]:
+    """Validate the repo's shape declaration. Returns a list of error strings."""
+    values, errors = collect_shape(project_dir)
+
+    for key in REQUIRED_SHAPE:
+        if key not in values:
+            errors.append(f"no bundle declares required shape key {key!r}")
+
+    layout = values.get("layout")
+    if layout and layout not in LAYOUTS:
+        errors.append(f"layout {layout!r} is not one of: {', '.join(LAYOUTS)}")
+    if layout == "monorepo" and "packages" not in values:
+        errors.append("layout is 'monorepo' but no bundle declares 'packages'")
+    if layout == "single-package" and "packages" in values:
+        errors.append("layout is 'single-package' but 'packages' is declared — remove it")
+
+    for key in ("subsystem-docs", "packages"):
+        pattern = values.get(key)
+        if pattern and not [p for p in glob.glob(os.path.join(project_dir, pattern)) if os.path.isdir(p)]:
+            errors.append(f"shape key {key!r} = {pattern!r} matches no directory — it must name a directory, not a file")
+
+    agent = values.get("output-judge-agent")
+    if agent and not os.path.isfile(os.path.join(project_dir, ".claude", "agents", f"{agent}.md")):
+        errors.append(f"output-judge-agent {agent!r} has no definition at .claude/agents/{agent}.md")
+
+    return errors
+
+
 def check_bundles(project_dir: str) -> int:
     """Resolve every selector in every bundle. Exit non-zero on any failure."""
     areas = available_areas(project_dir)
@@ -262,6 +342,13 @@ def check_bundles(project_dir: str) -> int:
                 failures += 1
             else:
                 print(f"ok   {area}: {path}")
+
+    shape_errors = check_shape(project_dir)
+    for error in shape_errors:
+        print(f"FAIL shape: {error}")
+    failures += len(shape_errors)
+    if not shape_errors:
+        print("ok   shape: every required key declared and resolving")
 
     print(f"\n{failures} failure(s) across {len(areas)} bundle(s).")
     return 1 if failures else 0
@@ -374,10 +461,15 @@ def render_bundle(project_dir: str, requested: str) -> int:
         entries = [entries]
 
     print(f"# Context loaded: {area}\n")
-    for key, label in SHAPE_FIELDS.items():
-        value = meta.get(key)
-        if isinstance(value, str) and value:
-            print(f"{label} `{value}`.\n")
+
+    shape, _ = collect_shape(project_dir)
+    declared = [(SHAPE_FIELDS[k], shape[k]) for k in SHAPE_FIELDS if k in shape]
+    if declared:
+        print("## This repo's shape\n")
+        for label, value in declared:
+            print(f"- {label} `{value}`.")
+        print()
+
     if body:
         print(body + "\n")
 

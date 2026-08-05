@@ -16,16 +16,40 @@ bundle that summarises its own sources becomes a fourth copy to maintain.
 
 ## Repo-shape keys
 
-`subsystem-docs` is not part of the reading list — it states where *this* repo
-keeps per-subsystem architecture docs, so a skill can be written once and run
-against repos laid out differently (`packages/*/docs/architecture/` in one,
-a flat `docs/architecture/` in another). It is rendered with the bundle, and a
-skill whose context posture forbids loading a whole bundle can read it alone:
+Shape keys are not part of the reading list. They state facts about *this* repo
+so a shared skill can be written once and run against repos built differently.
 
-    load.py <project> --field subsystem-docs
+| Key | Value | Example |
+|---|---|---|
+| `subsystem-docs` | Directory glob — where per-subsystem architecture docs live. **Must name a directory, not a file.** | `packages/*/docs/architecture/` |
+| `layout` | `monorepo` or `single-package` | `monorepo` |
+| `packages` | Directory glob for the packages. Required under `monorepo`, rejected under `single-package`. | `packages/*/` |
+| `typecheck-hook` | Name of the repo-wide type-check pre-commit hook | `mypy (strict, all packages)` |
+| `output-judge-agent` | Agent that judges generated output. Must exist at `.claude/agents/<name>.md`. | `data-analyst` |
 
-Declare it in one bundle only. It is a repo-level fact, and a second copy is a
-second thing to keep true.
+Declare each **in one bundle only** — a repo-level fact stated twice is two
+things to keep true, which is what shape keys exist to remove. `--check`
+rejects a duplicate even when the values agree.
+
+Two ways to read one. It renders above the bundle body, so a skill that loads
+`/understand` already has it; and a skill whose context posture forbids loading
+a whole bundle reads it alone:
+
+    load.py <project> --field layout
+
+**These are prompts, not programs.** "Configuring" a skill with a shape key
+means the skill body names both branches in its own prose and keys them to the
+declared value — *if `layout` is `monorepo`, split phases on package
+boundaries; if `single-package`, split on work-shape only*. There is no
+templating and no substitution.
+
+`layout` and `packages` are separate on purpose. `layout` decides *which prose
+applies* and every consumer reads it; `packages` supplies *a path* and only the
+worktree bootstrap needs it. Inferring the boolean from the glob's absence
+would make an omission indistinguishable from a misconfiguration.
+
+Adding a key is a commitment every adopting repo must keep. Add one only when a
+skill body would otherwise have to assume a layout.
 
 ## Writing the `context:` block
 
