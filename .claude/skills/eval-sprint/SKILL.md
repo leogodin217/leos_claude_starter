@@ -12,17 +12,23 @@ Adversarial evaluation of sprint spec before implementation. Run in a **new sess
 
 Find problems in the spec that would cause implementation to fail or produce poor results. The evaluator is deliberately adversarial — looking for ways the spec could be misinterpreted, is incomplete, or violates principles.
 
-## Context Loading
+## Context posture
+
+**Deliberately minimal — do NOT run `/understand`, and do NOT load architecture
+docs.** This is load-bearing, not an oversight. The question this skill answers
+is whether an implementer could build from the spec *alone*; anything you learn
+from an architecture doc is something the spec failed to say, and reading it
+hides the gap instead of reporting it. Any later edit that adds an architecture
+load here removes the thing the skill is for.
 
 Load ONLY:
-1. `CLAUDE.md` — Principles (especially #7 and #8)
-2. `docs/sprints/current/spec.md` — The spec to evaluate
+1. `CLAUDE.md` — Principles — especially no-invented-values and no-future-scaffolding. Already in context.
+2. `docs/sprints/<sprint-name>/spec.md` — The spec to evaluate
 
 **DO NOT load:**
-- Architecture docs (spec should be self-contained)
-- Capability docs (evaluating spec as written)
+- Architecture docs and capability docs (see above)
 - Previous conversation context (that's why new session)
-- **Source files via Read** — Do NOT read `.py` files to understand the codebase. Use LSP tools instead (see below).
+- **Source files via Read** — use LSP tools instead (see below).
 
 ## Code Verification — LSP Only
 
@@ -35,6 +41,7 @@ When verifying spec claims against the codebase (class names, function signature
 | "What's the signature?" | `get_hover` | Spec says `rng` param at line 203 — verify |
 | "What type is this?" | `get_hover` | Spec references `Distribution` union — verify it exists |
 | "Does this symbol exist in the module?" | `find_workspace_symbols` | Spec says export from `__init__.py` — verify |
+| "Who calls this / what does it call?" | `get_incoming_calls` / `get_outgoing_calls` | Spec claims a caller count or call chain — trace it across module and package boundaries |
 
 **NEVER** use `Read` on source files for this skill. If you catch yourself about to read a `.py` file, use an LSP tool instead.
 
@@ -49,11 +56,11 @@ When verifying spec claims against the codebase (class names, function signature
 - [ ] File structure section shows where code goes
 
 ### Principle Checks
-- [ ] No default parameters in any signature (Principle #7)
-- [ ] No `= None`, `= []`, `= {}` in signatures (Principle #7)
-- [ ] No "Future:", "TODO:", "placeholder", "stub" language (Principle #8)
-- [ ] No loops/iterations described that "will do X later" (Principle #8)
-- [ ] No hardcoded domain values in contracts (Principle #2)
+- [ ] No default parameters in any signature (the no-invented-values principle)
+- [ ] No `= None`, `= []`, `= {}` in signatures (the no-invented-values principle)
+- [ ] No "Future:", "TODO:", "placeholder", "stub" language (the no-future-scaffolding principle)
+- [ ] No loops/iterations described that "will do X later" (the no-future-scaffolding principle)
+- [ ] No hardcoded domain values in contracts (the no-hardcoded-domains principle)
 
 ### Consistency Checks
 - [ ] All types referenced in contracts exist (in spec or codebase)
@@ -213,7 +220,7 @@ Observations that aren't issues but worth considering.
 |-------|---------------|
 | Missing contract for stated scope | Implementer won't know what to build |
 | Undefined type referenced | Code won't compile |
-| Default parameter in signature | Principle #7 violation |
+| Default parameter in signature | No-invented-values violation |
 | Phase dependency violation | Phase N can't be built |
 | Ambiguous return type | Implementer will guess wrong |
 

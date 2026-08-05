@@ -26,7 +26,9 @@ People ask how to get started and this is a resource for them. That's it. I high
 
 ## Quick Start
 
-1. Copy this template to your project
+1. Read `ADOPTION.md` — the contract for adopting the shared skills and
+   agents (symlinked, configured per repo by shape keys, gated by
+   `load.py --check`)
 2. Run `/get-started` to configure your project interactively
 3. Start designing with `/arch-design`
 
@@ -42,13 +44,15 @@ Or customize manually - see `CUSTOMIZATION.md` for detailed guidance.
 
 ```
 /get-started       →  Configure project (run once)
+/whats-next        →  Diagnose project state, recommend next step
 /arch-design       →  Design interfaces, create architecture docs
+/arch-review       →  Review pending architecture docs
 /create-sprint     →  Plan implementation phases
 /eval-sprint       →  Evaluate sprint spec before implementation
 /implement-sprint  →  Execute the plan
-/review-sprint     →  QA and verify
-/verify-sprint     →  Final verification of sprint deliverables
+/review-sprint     →  Post-implementation mechanical audit
 /audit-docs        →  Keep documentation accurate
+/fold-pending      →  Fold shipped pending designs into canonical docs
 ```
 
 ## Directory Structure
@@ -174,10 +178,7 @@ See `CUSTOMIZATION.md` for detailed guidance on:
    ├── Verify against sprint spec
    └── Check principle compliance
 
-7. VERIFICATION (/verify-sprint)
-   └── Final verification of sprint deliverables
-
-8. DOCUMENTATION (/audit-docs)
+7. DOCUMENTATION (/audit-docs)
    ├── Prune architecture doc, link to code
    └── Update CAPABILITIES.md (status: Complete)
 ```

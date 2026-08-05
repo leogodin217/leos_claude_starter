@@ -186,167 +186,28 @@ Create an architecture doc when:
 
 ---
 
-## Step 6: Customize Skills
+## Step 6: Skills and Agents — the Adoption Contract
 
-The template includes skills for the full development lifecycle. Customize as needed.
+Skills and agents are no longer customized per repo. The shared bodies live in
+this repo and are **symlinked** into adopting repos; repo differences are
+handled by declared shape keys, per-repo assembled files (`worker-protocol.md`,
+the system prompt), and repo-only skills/agents — never by editing a shared
+body for one repo.
 
-### Modifying Skills
+**Read `ADOPTION.md`** for the full contract: what the starter provides, the
+repo-side artifacts you must add (CLAUDE.md sections, the `understand` bundle
+with shape keys, a worker-protocol with your config-boundary section, an
+output-judge agent), the `load.py --check` gate, and the ladder for handling a
+repo difference without forking a skill.
 
-Each skill in `.claude/skills/` can be customized:
-
-- **Add domain context** - Reference your specific docs
-- **Add checklists** - Domain-specific review items
-- **Add rules** - Domain-specific constraints
-
-### Adding New Skills
-
-Create a new directory in `.claude/skills/` with a `SKILL.md` file:
-
-```markdown
----
-name: skill-name
-description: Brief description of what this skill does.
-disable-model-invocation: true
----
-
-# {Skill Name}
-
-You are the **{Role}**. {One sentence purpose.}
-
-## Load Context
-{What to read}
-
-## Process
-{Steps to follow}
-
-## Rules
-{Constraints}
-
-## DO NOT
-{Explicit prohibitions}
-```
-
-### Example: Domain-Specific Reviewer
-
-```markdown
----
-name: security-review
-description: Security-focused code review.
-disable-model-invocation: true
----
-
-# Security Review
-
-You are the **Security Reviewer**.
-
-## Load Context
-1. CLAUDE.md
-2. Security architecture doc
-3. Code changes
-
-## Checklist
-- [ ] No SQL injection
-- [ ] No XSS vulnerabilities
-- [ ] Auth checks on all endpoints
-- [ ] Secrets not in code
-...
-```
+Genuinely repo-specific skills and agents stay in your repo, in the same
+formats — see `.claude/agents/README.md` for the agent format and design
+rules; a skill is a directory under `.claude/skills/` with a `SKILL.md`.
 
 ---
 
-## Step 7: Customize Agents
 
-The template includes two starter agents in `.claude/agents/`:
-
-| Agent | Purpose |
-|-------|---------|
-| `architect` | System design, contracts, architecture docs |
-| `implementer` | Code, tests, matching specs exactly |
-
-### Agent File Format
-
-Agents are markdown files with YAML frontmatter:
-
-```markdown
----
-name: agent-name
-description: Brief description for Task tool
-tools: Read, Grep, Glob, Write, Edit
-model: sonnet
----
-
-You are the {Role} for this project.
-
-## Your Purpose
-{What this agent does}
-
-## What You Produce
-{Outputs}
-
-## What You Do NOT Do
-{Explicit constraints}
-```
-
-### Adding Domain-Specific Agents
-
-Common agents to add as your project grows:
-
-| Agent | When to Add |
-|-------|-------------|
-| `reviewer` | When you want fresh-eyes code review |
-| `data-analyst` | When you need to validate output data |
-| `doc-auditor` | When documentation accuracy matters |
-| `test-reviewer` | When test quality is important |
-| `security-reviewer` | When security review is needed |
-
-### Agent Design Principles
-
-1. **Minimal context** - Load only what's needed
-2. **Clear constraints** - Explicit "do not" section
-3. **Specific outputs** - Define exactly what the agent produces
-4. **Tool restrictions** - Only grant tools the agent needs
-
-### Example: Adding a Reviewer Agent
-
-Create `.claude/agents/reviewer.md`:
-
-```markdown
----
-name: reviewer
-description: Fresh-eyes code reviewer. Loads minimal context intentionally.
-tools: Read, Grep, Bash
-model: sonnet
----
-
-You are the Reviewer. You review code with fresh eyes.
-
-## Fresh Eyes Protocol
-
-You intentionally load MINIMAL context:
-- The sprint spec (current phase only)
-- The principles from CLAUDE.md
-- The implementation diff
-
-## What You Check
-
-- [ ] Code matches spec
-- [ ] No principle violations
-- [ ] No anti-patterns from CLAUDE.md
-
-## Output
-
-APPROVED or REVISIONS NEEDED with specific issues.
-
-## What You Do NOT Do
-
-- Fix code yourself
-- Make architectural suggestions
-- Approve code with principle violations
-```
-
----
-
-## Step 8: Use the SCRATCHPAD
+## Step 7: Use the SCRATCHPAD
 
 `docs/SCRATCHPAD.md` tracks current work across sessions.
 

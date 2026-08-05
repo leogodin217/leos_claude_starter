@@ -1,35 +1,69 @@
+---
+status: draft
+---
+
 # Feature Name
 
-**Status:** Design draft
+A pending architecture doc describing a specific change to the system. Lives at
+`docs/architecture/pending/<name>.md`.
+
+The sections below are a flat list — no zones. `Affected Subsystems` is the
+prose description of which subsystems the change touches; there is no
+frontmatter scope declaration.
 
 ---
 
 ## Problem
 
-What's wrong or missing. Include a concrete example: config snippet showing the limitation, error message, or workflow that doesn't work.
+What's wrong or missing. Include a concrete example: config snippet showing the
+limitation, error message, or workflow that doesn't work.
 
 ## Solution
 
-High-level approach. One paragraph describing the design direction, plus a diagram or YAML snippet showing the end state.
+High-level approach. One paragraph describing the design direction, plus a
+diagram or YAML snippet showing the end state.
 
----
+## Affected Subsystems
+
+Name the subsystems / packages this design touches and describe the
+*behavioral or contract* change each one undergoes. No file paths, no line
+ranges, no import tables, and no references to which sibling architecture-doc
+sections will be rewritten — production docs are updated after implementation,
+separately from this design.
+
+- **Subsystem A** — what changes about its contract or behavior.
+- **Subsystem B** — what new dependency or invariant it picks up.
+
+## What Doesn't Change
+
+Explicit scope boundaries — a fence against scope creep during implementation.
+
+- Unchanged feature A.
+- Unchanged feature B.
 
 ## Semantics
 
-Behavioral rules, edge cases, ordering, and timing. Use tables for testable conditions:
+Behavioral rules, edge cases, ordering, and timing. Use tables for testable
+conditions:
 
 | Condition | Result |
 |-----------|--------|
 | X happens | Y occurs |
 | X doesn't happen | Z occurs |
 
-Cover: ordering within a tick, interaction with existing features, boundary cases.
+Cover: ordering within a tick, interaction with existing features, boundary
+cases. State the invariants the design relies on and the invariants it
+introduces.
 
-Describe behavior in prose and tables. Do NOT include implementation code blocks (for-loops, if-statements, function bodies). Wrong: showing a code block of the loop to insert into `processor.py`. Right: "Mutations apply once per behavior firing, after decisions are produced. No decisions = no mutation."
+Describe behavior in prose and tables. Do NOT include implementation code blocks
+(for-loops, if-statements, function bodies). Wrong: showing a code block of the
+loop to insert into `processor.py`. Right: "Mutations apply once per behavior
+firing, after decisions are produced. No decisions = no mutation."
 
 ## Configuration
 
-YAML examples showing educator-facing config (skip if feature has no config surface).
+YAML examples showing educator-facing config (skip if feature has no config
+surface).
 
 ```yaml
 # Example config
@@ -41,7 +75,9 @@ YAML examples showing educator-facing config (skip if feature has no config surf
 
 ## Interface Contracts
 
-Full function signatures with docstrings. Group by category. Signatures and docstrings ONLY — no implementation bodies, no inline code showing where to insert changes.
+Full function signatures with docstrings. Group by category. Signatures and
+docstrings ONLY — no implementation bodies, no inline code showing where to
+insert changes.
 
 ### Config Models
 
@@ -82,32 +118,6 @@ def function_name(
     """
 ```
 
-For modified functions, describe the behavioral change in the docstring. Do not show the implementation diff — that's the sprint implementer's job.
-
-## Implementation Impact
-
-### Source Files
-
-| Action | File | Change |
-|--------|------|--------|
-| Create | `packages/.../new_module.py` | New module for X |
-| Modify | `packages/.../existing.py` | Add Y field, update Z |
-
-### Test Files
-
-| Action | File | Change |
-|--------|------|--------|
-| Create | `packages/.../tests/test_new.py` | Unit tests for X |
-| Modify | `packages/.../tests/test_existing.py` | Add cases for new behavior |
-
-### Import Updates
-
-Files affected by moved, renamed, or relocated symbols.
-
-| File | Current Import | New Import |
-|------|---------------|------------|
-| `path/to/file.py` | `from old.module import X` | `from new.module import X` |
-
 ## Validation Rules
 
 ### Parse-Time (Pydantic)
@@ -127,14 +137,3 @@ Rule subclasses registered in the validation runner.
 | Rule | Checks | Error Message |
 |------|--------|---------------|
 | `RuleName` | What it validates | `"Error text with {interpolation}"` |
-
-## What Doesn't Change
-
-Explicit scope boundaries. List things that stay the same to prevent scope creep during implementation.
-
-- Unchanged feature A (stays as-is because...)
-- Unchanged feature B (not affected because...)
-
----
-
-*Ready for sprint planning.*

@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""mdnav: print heading outline (or full content) of a markdown file.
+
+For files >= SMALL_FILE_THRESHOLD lines: prints `START-END  LEVEL_INDENT# HEADING_TEXT`
+for each heading (line numbers 1-indexed; END is the line before the next
+heading at same-or-higher level, else EOF). Compose with
+`Read file.md offset=START limit=(END-START+1)` to load a section.
+
+For files below the threshold: prints the full file with line numbers, since
+an outline of a small file saves nothing.
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+FENCE = re.compile(r"^(```|~~~)")
+
+SMALL_FILE_THRESHOLD = 200
+
+
+def outline(text: str) -> list[tuple[int, int, int, str]]:
+    lines = text.splitlines()
+    headings: list[tuple[int, int, str]] = []
+    in_fence = False
+    for i, line in enumerate(lines, 1):
+        if FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        m = HEADING.match(line)
+        if m:
+            headings.append((i, len(m.group(1)), m.group(2)))
+
+    eof = len(lines)
+    result: list[tuple[int, int, int, str]] = []
+    for idx, (start, level, txt) in enumerate(headings):
+        end = eof
+        for nxt_start, nxt_level, _ in headings[idx + 1 :]:
+            if nxt_level <= level:
+                end = nxt_start - 1
+                break
+        result.append((start, end, level, txt))
+    return result
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print("usage: mdnav FILE.md", file=sys.stderr)
+        return 2
+    path = Path(argv[1])
+    if not path.is_file():
+        print(f"mdnav: not a file: {path}", file=sys.stderr)
+        return 1
+
+    text = path.read_text()
+    n_lines = len(text.splitlines())
+
+    if n_lines < SMALL_FILE_THRESHOLD:
+        print(f"=== {path} ({n_lines} lines, full content) ===")
+        for i, line in enumerate(text.splitlines(), 1):
+            print(f"{i:>5}  {line}")
+        return 0
+
+    print(f"=== {path} ({n_lines} lines, outline) ===")
+    for start, end, level, txt in outline(text):
+        indent = "  " * (level - 1)
+        print(f"{start:>4}-{end:<4}  {indent}{'#' * level} {txt}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

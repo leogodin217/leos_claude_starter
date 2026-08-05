@@ -1,93 +1,39 @@
 # Agents and Skills
 
-## Overview
+**Agents** are workers with specific expertise, tools, and constraints,
+invoked via the Task tool. **Skills** are processes that orchestrate work,
+invoked via the Skill tool (slash commands). Skills dispatch agents.
 
-**Agents** are workers with specific expertise, tools, and constraints.
-**Skills** are processes that orchestrate work.
+## Shared agents (symlinked into adopting repos)
 
-```
-.claude/
-├── agents/           # Workers
-│   ├── architect.md
-│   └── implementer.md
-│
-└── skills/           # Processes
-    ├── get-started/
-    ├── arch-design/
-    ├── arch-review/
-    ├── create-sprint/
-    ├── eval-sprint/
-    ├── implement-sprint/
-    ├── review-sprint/
-    ├── verify-sprint/
-    ├── audit-docs/
-    ├── review-tests/
-    ├── role-architect/
-    └── role-educator/
-```
-
----
-
-## Agents vs Skills
-
-| Aspect | Agents | Skills |
-|--------|--------|--------|
-| Purpose | Do specific work | Orchestrate workflows |
-| Scope | Single focused task | Multi-step processes |
-| Invocation | Task tool | Skill tool (slash commands) |
-| Context | Minimal, focused | Full conversation |
-
----
-
-## Agents
-
-| Agent | Tools | Purpose |
-|-------|-------|---------|
-| `architect` | Read, Grep, Glob, Write, Edit | System design, contracts, ADRs |
-| `implementer` | Read, Write, Edit, Bash, Glob, Grep | Code, tests, demos |
-
-### architect
-
-Designs systems and interfaces. Produces:
-- Interface contracts (signatures + docstrings)
-- Architecture documents
-- Design decisions with rationale
-
-Use when: Planning features, making design decisions, creating architecture docs.
-
-### implementer
-
-Writes code matching specifications exactly. Produces:
-- Implementation code
-- Tests
-- Demo scripts (if needed)
-
-Use when: Implementing sprint phases.
-
----
-
-## Skills (Slash Commands)
-
-| Skill | Purpose |
+| Agent | Purpose |
 |-------|---------|
-| `/get-started` | Configure project (run once at setup) |
-| `/arch-design` | Design interfaces, create architecture docs |
-| `/arch-review` | Review architecture decisions |
-| `/create-sprint` | Plan implementation phases |
-| `/eval-sprint` | Evaluate sprint spec before implementation |
-| `/implement-sprint` | Execute sprint phases |
-| `/review-sprint` | Review implementation against spec |
-| `/verify-sprint` | Final verification of sprint deliverables |
-| `/audit-docs` | Verify docs match implementation |
-| `/review-tests` | Review test quality |
-| `/role-architect` | Switch to architecture/design mode |
-| `/role-educator` | Switch to educator persona |
+| `architect` | System design, interface contracts, ADRs |
+| `implementer` | Code, tests, demos matching a sprint spec exactly |
+| `reviewer` | Fresh-eyes review: principle compliance, anti-patterns |
+| `doc-auditor` | Docs-vs-code discrepancy audit |
+| `test-reviewer` | Test value, quality, and gap review |
 
----
+These bodies are repo-neutral by contract:
 
-## Adding Agents
+- **No repo principle content.** Repo principles reach agents two ways: the
+  SubagentStart hook injects the repo's `worker-protocol.md` (which carries
+  the repo's config-boundary section), and agents read the repo's `CLAUDE.md`
+  § Core Principles at task start.
+- **No principle citations by number.** Numbering is repo-local and collides
+  across repos; shared bodies cite principles by name only.
+- **No repo vocabulary.** Prose names roles (author, source tree, output
+  judge), never one repo's instances.
 
-Create a new `.md` file in `.claude/agents/` with this format:
+Each adopting repo adds its own **output-judge agent** (named by the
+`output-judge-agent` shape key) — an agent that reads program output rather
+than source, listed in the inject hook's `CODE_NAV_EXEMPT`.
+
+See `ADOPTION.md` at the repo root for the full contract.
+
+## Adding an agent
+
+Create `.claude/agents/<name>.md`:
 
 ```markdown
 ---
@@ -97,73 +43,14 @@ tools: Tool1, Tool2, Tool3
 model: sonnet
 ---
 
-You are the {Role} for {Project}.
-
-## Your Purpose
-
-{What this agent does}
+You are the {Role}. {One-sentence job.}
 
 ## What You Produce
-
-{Outputs}
-
 ## What You Do NOT Do
-
-{Explicit constraints}
 ```
 
-### Agent Design Principles
-
-1. **Minimal context** - Load only what's needed for the task
-2. **Clear constraints** - Explicit "do not" section
-3. **Specific outputs** - Define exactly what the agent produces
-4. **Tool restrictions** - Only grant tools the agent needs
-
----
-
-## Adding Domain-Specific Agents
-
-As your project grows, consider adding:
-
-| Agent Type | When to Add |
-|------------|-------------|
-| `reviewer` | When you want fresh-eyes code review |
-| `data-analyst` | When you need to validate output data |
-| `doc-auditor` | When documentation accuracy matters |
-| `test-reviewer` | When test quality is important |
-
-See CUSTOMIZATION.md for guidance on creating domain-specific agents.
-
----
-
-## Workflow
-
-```
-/create-sprint
-    │
-    ├─→ architect agent (design contracts)
-    │
-    └─→ Produces: sprint spec
-
-/eval-sprint
-    │
-    └─→ Evaluate spec completeness
-
-/implement-sprint
-    │
-    ├─→ For each phase:
-    │       │
-    │       ├─→ implementer agent (code + tests)
-    │       ├─→ quality gates (linter, tests)
-    │       └─→ commit
-    │
-    └─→ Update docs when complete
-
-/review-sprint
-    │
-    └─→ Review implementation against spec
-
-/verify-sprint
-    │
-    └─→ Final verification of deliverables
-```
+Design rules: minimal context, explicit "do not" constraints, exact output
+format, only the tools the agent needs. If the agent is general — useful to
+any adopting repo — it belongs here and must meet the repo-neutral contract
+above. If a sentence in it cannot be written without naming one repo's nouns,
+it is a repo agent; keep it in that repo.

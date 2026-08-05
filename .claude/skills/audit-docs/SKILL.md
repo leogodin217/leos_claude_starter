@@ -2,22 +2,36 @@
 name: audit-docs
 description: Orchestrate sequential documentation audits with checkpointing and resumption.
 disable-model-invocation: true
+argument-hint: package_name
 ---
 
 # Audit Docs
 
 Orchestrate sequential documentation audits with file-based checkpointing. Enables resumption across sessions.
 
+## Context posture
+
+**Task-scoped — the audited subsystem's docs and the code they claim.** Do NOT
+run `/understand`; do NOT load repo-wide architecture. An audit asks whether
+*this subsystem's* docs match *its own* code, and wider context lets the
+orchestrator paper over a gap from memory instead of flagging it. The
+`doc-auditor` agents load what each audit area needs, in their own contexts.
+
 ## Output Location
 
+An audit writes beside the docs it audited. **`<audit-root>` below means an
+`audits/` sibling of the `architecture/` directory the discovery step globbed**
+— so findings live with the subsystem they concern, in either repo layout. In
+this repo that resolves to `packages/<pkg>/docs/audits/`.
+
 ```
-docs/audits/
+<audit-root>/
   YYYY-MM-DD_HHMMSS/
     manifest.yaml         # checkpoint state
     summary.md            # generated after all audits complete
     findings/
-      actors.md
-      behaviors.md
+      config.md
+      validation.md
       ...
 ```
 
@@ -27,18 +41,14 @@ docs/audits/
 
 Look for existing sessions:
 ```
-Glob: docs/audits/*/manifest.yaml
+Glob: <audit-root>/*/manifest.yaml
 ```
 
 For each manifest found, read it. If any has `status: auditing` or `status: summarizing`:
 
-```
-AskUserQuestion:
-  question: "Found incomplete audit session from {session_id}. How should I proceed?"
-  options:
-    - "Resume the incomplete session"
-    - "Start a fresh audit (abandons previous)"
-```
+Ask in chat — not via the question interface (`CLAUDE.md` § Asking Questions):
+name the session id and its status, and offer resuming it or starting fresh
+(which abandons it).
 
 If "Resume" → skip to Phase 2 or 3 based on manifest status.
 If "Start fresh" → continue to initialization.
@@ -50,23 +60,27 @@ If no incomplete sessions found, proceed to initialization.
 Create session folder:
 ```
 session_id = current timestamp as "YYYY-MM-DD_HHMMSS"
-folder = docs/audits/{session_id}/
+folder = <audit-root>/{session_id}/
 ```
 
 Create the folder structure:
 ```
-docs/audits/{session_id}/
-docs/audits/{session_id}/findings/
+<audit-root>/{session_id}/
+<audit-root>/{session_id}/findings/
 ```
 
-Discover architecture docs:
+Ask the repo where its subsystem docs live, rather than assuming a layout:
+
+```bash
+~/.claude/skills/understand/load.py . --field subsystem-docs
 ```
-Glob: docs/architecture/*.md
-```
+
+Glob `*.md` under what it prints — that is one directory per subsystem in a
+packaged repo, and a single flat directory in a repo that keeps them together.
+This one call is the whole reason this skill can run unmodified in either.
 
 **Exclude:**
 - `README.md` (index/navigation)
-- `PROCESS.md` (workflow documentation)
 
 Write initial manifest:
 ```yaml
@@ -74,15 +88,11 @@ session_id: "{session_id}"
 created_at: "{ISO timestamp}"
 status: "auditing"
 docs:
-  - name: "actors.md"
-    path: "docs/architecture/actors.md"
+  - name: "config.md"
+    path: "{discovered path}"        # repo-relative, as globbed above
     status: "pending"
     error: null
-  - name: "behaviors.md"
-    path: "docs/architecture/behaviors.md"
-    status: "pending"
-    error: null
-  # ... all discovered docs
+  # ... one entry per discovered doc
 ```
 
 Report: "Created audit session {session_id} with {N} docs to audit."
@@ -95,14 +105,15 @@ For each pending doc, **one at a time**:
 
 1. **Update manifest** - set doc `status: "auditing"`
 
-2. **Launch doc-auditor agent** (NOT in background):
+2. **Launch doc-auditor agent** via the **Agent tool** (foreground — one doc at a time):
    ```
-   Task(
+   Agent(
        subagent_type="doc-auditor",
-       prompt="Audit this architecture doc against implementation.\n\ndoc_path: {doc_path}",
-       run_in_background=false
+       description="Audit {doc_name}",
+       prompt="Audit this architecture doc against implementation.\n\ndoc_path: {doc_path}"
    )
    ```
+   The call blocks until the agent finishes and returns its final message directly as the result.
 
 3. **Write findings file** - take agent response and write to `findings/{doc_name}`:
    ```markdown
@@ -176,21 +187,14 @@ Once all docs have `status: complete` or `status: error`:
 
 4. **Update manifest** - set `status: "complete"`
 
-5. **Report**: "Audit complete. Summary written to docs/audits/{session_id}/summary.md"
+5. **Report**: "Audit complete. Summary written to <audit-root>/{session_id}/summary.md"
 
 ### 5. Present and Ask for Approval
 
 Display the summary to the user (read and output summary.md content).
 
-Then ask:
-```
-AskUserQuestion:
-  question: "How should I proceed with documentation updates?"
-  options:
-    - "Fix all findings"
-    - "Show me the specific changes first"
-    - "Skip updates for now"
-```
+Then ask in chat how to proceed — fix all findings, show the specific changes
+first, or skip updates for now.
 
 ### 6. Apply Fixes (If Approved)
 
@@ -208,14 +212,7 @@ Report each change made.
 
 ### 7. Verification (Optional)
 
-After fixes, offer to re-run audit on modified docs only:
-```
-AskUserQuestion:
-  question: "Want me to verify the fixes?"
-  options:
-    - "Yes, re-audit modified docs"
-    - "No, I'll review manually"
-```
+After fixes, offer in chat to re-audit the modified docs only.
 
 ---
 
@@ -226,8 +223,8 @@ session_id: str        # "YYYY-MM-DD_HHMMSS"
 created_at: str        # ISO 8601 timestamp
 status: str            # "auditing" | "summarizing" | "complete"
 docs:
-  - name: str          # "actors.md"
-    path: str          # "docs/architecture/actors.md"
+  - name: str          # "config.md"
+    path: str          # repo-relative path as globbed from subsystem-docs
     status: str        # "pending" | "auditing" | "complete" | "error"
     error: str | null  # error message if status=error
 ```
@@ -264,9 +261,10 @@ docs:
 
 The doc-auditor agent discovers code paths from within the doc itself:
 
-1. **Explicit references:** Look for `src/fabulexa/...` paths in the doc
+1. **Explicit references:** source paths named in the doc
 2. **Code References section:** Many docs have a table linking topics to files
-3. **Naming convention:** `{name}.md` often maps to `src/fabulexa/{name}/`
+3. **Naming convention:** `<name>.md` often maps to a `<name>/` module in the
+   subsystem's source tree
 
 The agent should NOT rely on a hardcoded mapping.
 
@@ -282,21 +280,21 @@ Claude: Checking for incomplete sessions...
 
         Creating audit session 2025-01-21_143022 with 10 docs to audit.
 
-        Auditing actors.md...
-        Completed 1/10: actors.md - 2 findings
+        Auditing config.md...
+        Completed 1/10: config.md - 2 findings
 
-        Auditing behaviors.md...
-        Completed 2/10: behaviors.md - 0 findings
+        Auditing validation.md...
+        Completed 2/10: validation.md - 0 findings
 
         ...
 
-        Audit complete. Summary written to docs/audits/2025-01-21_143022/summary.md
+        Audit complete. Summary written to <audit-root>/2025-01-21_143022/summary.md
 
         # Documentation Audit Summary
         ...
 
-        How should I proceed with documentation updates?
-        [Fix all findings] [Show changes first] [Skip updates]
+        How should I proceed with documentation updates — fix all findings,
+        show the specific changes first, or skip updates for now?
 ```
 
 ## Example: Resume After Context Exhaustion
@@ -315,8 +313,8 @@ User: Resume
 
 Claude: Resuming session 2025-01-21_143022...
 
-        Auditing simulation.md...
-        Completed 7/10: simulation.md - 1 finding
+        Auditing pipeline.md...
+        Completed 7/10: pipeline.md - 1 finding
 
         ...
 ```
