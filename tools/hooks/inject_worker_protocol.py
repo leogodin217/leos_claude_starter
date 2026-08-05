@@ -16,10 +16,11 @@ because a subagent has no user to address and no session to configure.
 
 Opt-out by design: an agent whose job is to read program OUTPUT rather than
 source code (a data analyst judging emitted artifacts, an ops gate running
-given commands) should not receive code-navigation rules — they are noise. List
-such agents in CODE_NAV_EXEMPT; they get only the sections in GENERAL_SECTIONS.
-CODE_NAV_EXEMPT is per-repo configuration: each adopting repo edits it to name
-its own output-reading agents.
+given commands) should not receive code-navigation rules — they are noise.
+Which agents those are is per-repo configuration: the adopting repo lists them
+under `code_nav_exempt` in `.claude/hooks-config.json` (the hook body stays
+shared and symlinked). Missing file or key = no exemptions, everyone gets the
+full protocol. Exempt agents get only the sections in GENERAL_SECTIONS.
 
 SubagentStart is context-only (it cannot block). It prints a
 hookSpecificOutput.additionalContext JSON object and exits 0; on any failure to
@@ -36,11 +37,7 @@ import sys
 from pathlib import Path
 
 PROTOCOL_RELPATH = ".claude/worker-protocol.md"
-
-# Per-repo: agents whose job is to read program OUTPUT, not source code. They
-# still get the reporting and response-style rules — just not code navigation
-# or the repo's code-principle sections.
-CODE_NAV_EXEMPT: frozenset[str] = frozenset()
+CONFIG_RELPATH = ".claude/hooks-config.json"
 
 # Sections a code-nav-exempt agent still receives, by `## ` heading prefix.
 GENERAL_SECTIONS = ("Reporting", "File Reading", "Response Style")
@@ -50,7 +47,19 @@ def _project_dir() -> Path:
     env = os.environ.get("CLAUDE_PROJECT_DIR")
     if env:
         return Path(env)
-    return Path(__file__).resolve().parent.parent.parent
+    # No .resolve(): this file may be a symlink into the starter, and resolving
+    # it would anchor the fallback in the starter's tree, not the adopting repo's.
+    return Path(os.path.abspath(__file__)).parent.parent.parent
+
+
+def _code_nav_exempt(root: Path) -> frozenset[str]:
+    """Per-repo: agents that read program OUTPUT, not source code. They still
+    get the reporting and response-style rules — just not code navigation."""
+    try:
+        config = json.loads((root / CONFIG_RELPATH).read_text())
+    except (OSError, json.JSONDecodeError):
+        return frozenset()
+    return frozenset(config.get("code_nav_exempt", []))
 
 
 def _split_sections(text: str) -> list[tuple[str, str]]:
@@ -71,12 +80,13 @@ def main() -> int:
     except json.JSONDecodeError:
         return 0
 
+    root = _project_dir()
     try:
-        text = (_project_dir() / PROTOCOL_RELPATH).read_text()
+        text = (root / PROTOCOL_RELPATH).read_text()
     except OSError:
         return 0
 
-    if payload.get("agent_type") in CODE_NAV_EXEMPT:
+    if payload.get("agent_type") in _code_nav_exempt(root):
         sections = _split_sections(text)
         text = "".join(
             body

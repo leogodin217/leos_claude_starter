@@ -48,7 +48,24 @@ below the intro line so drift is greppable.
 `tools/hooks/mdnav_first.py` (outline-first read enforcement),
 `tools/hooks/grep_guard.py` (cclsp-first enforcement),
 `tools/hooks/inject_worker_protocol.py` (SubagentStart protocol injection),
-and the `understand` loader (`load.py`, `template.md`).
+`tools/hooks/deny_question_tool.py` (AskUserQuestion block),
+`tools/hooks/git_commit_guard.py` (subagent git-write block),
+and the `understand` loader (`load.py`, `template.md`). Hooks are symlink
+targets like the skills; their per-repo knobs live in the adopting repo's
+`.claude/hooks-config.json`, never in the hook body.
+
+### Symlink form
+
+Links are committed **relative**: `../../../leos_claude_starter/...` from
+`.claude/skills/`, `.claude/agents/`, and `tools/hooks/`. This assumes two
+layout conventions, which the adopting machine must keep:
+
+1. The starter is cloned as a **sibling of the repo** (both under the same
+   parent directory).
+2. Git worktrees are created at the **same depth** as the main checkout — or,
+   if they live one level deeper (e.g. `<parent>/worktrees/<branch>`), the
+   machine adds one compensating link:
+   `ln -s ../leos_claude_starter <parent>/worktrees/leos_claude_starter`.
 
 ## What the adopting repo must provide
 
@@ -93,8 +110,24 @@ configure. The shared `reviewer` and `implementer` name this section as their
 primary focus; without it their primary focus resolves to nothing.
 
 Register `tools/hooks/inject_worker_protocol.py` as a SubagentStart hook
-(matcher `*`) in `.claude/settings.json`, and set its `CODE_NAV_EXEMPT` to the
-repo's output-reading agents.
+(matcher `*`) in `.claude/settings.json`.
+
+### `.claude/hooks-config.json`
+
+The per-repo knobs the shared hooks read (missing file or key = safe-empty):
+
+```json
+{
+  "code_nav_exempt": ["data-analyst"],
+  "git_committers": []
+}
+```
+
+- `code_nav_exempt` — agents that read program OUTPUT, not source code
+  (typically the output-judge agent); they receive only the general worker-
+  protocol sections, not code navigation.
+- `git_committers` — agents allowed to run mutating git besides the top-level
+  orchestrator. Empty means orchestrator-only.
 
 ### Repo-specific agents and skills
 
