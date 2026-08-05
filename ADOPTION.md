@@ -37,10 +37,12 @@ infrastructure skills `understand`, `note`, `consult`, `session`,
 repo principles reach them through the injected worker protocol and by reading
 the repo's `CLAUDE.md` at task start.
 
-**Assembled-file bases**: `.claude/worker-protocol.md` (generic sections).
-System-prompt fragments (harness, operating discipline, verbosity, legibility)
-are not yet extracted here — until they are, an adopting repo assembles its
-system prompt from an existing adopter's as reference.
+**Assembled-file bases**: `.claude/worker-protocol.md` (generic sections) and
+`.claude/system-prompt-base.md` (harness, operating discipline, environment,
+tools, verbosity, legibility). A repo's `custom-system-prompt.md` is an intro
+line naming the repo plus the base content, delivered by the launch alias.
+The base file is pure prompt content — keep repo copies byte-identical to it
+below the intro line so drift is greppable.
 
 **Tools**: `tools/mdnav` (markdown outline navigation),
 `tools/hooks/mdnav_first.py` (outline-first read enforcement),
