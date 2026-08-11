@@ -63,7 +63,7 @@ def _code_nav_exempt(root: Path) -> frozenset[str]:
 
 
 def _split_sections(text: str) -> list[tuple[str, str]]:
-    """Split on level-2 headings, returning (heading-text, section-including-heading)."""
+    """Split on level-2 headings into (heading-text, section-with-heading)."""
     parts = re.split(r"^(## .+)$", text, flags=re.MULTILINE)
     out: list[tuple[str, str]] = []
     # parts[0] is the preamble (title + intro); keep it under an empty heading.

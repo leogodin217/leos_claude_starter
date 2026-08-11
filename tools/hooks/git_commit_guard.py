@@ -63,6 +63,7 @@ def _git_committers() -> frozenset[str]:
         return frozenset()
     return frozenset(config.get("git_committers", []))
 
+
 # git subcommands that mutate the index, working tree, refs, or remote. Denied
 # for non-committer subagents. `branch` is handled separately (destructive flags
 # only). Unlisted verbs pass — this is a denylist, preserving read-only git.
