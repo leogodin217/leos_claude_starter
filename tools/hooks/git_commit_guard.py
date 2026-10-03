@@ -21,8 +21,11 @@ subagent is blocked from git-write while read-only git still passes.
     file or key = no subagent may mutate git.
   - DENY: any other subagent (implementer, reviewer, Explore, …) invoking a
     mutating git verb — commit, add, merge, rebase, cherry-pick, reset, push,
-    stash, notes, tag, worktree, and siblings (see MUTATING_VERBS).
+    stash, tag, worktree, and siblings (see MUTATING_VERBS).
     `branch` is denied only with a destructive/move flag (-d/-D/-m/-M/-f).
+    `notes` is denied only for mutating subcommands (add/edit/remove/…);
+    read-only `notes show`/`list`/`get-ref` pass so reviewers can audit
+    sprint notes.
   - PASS (read-only orientation, per the finding's settled decision — this is a
     mutating-verb *denylist*, not an all-git block): status, log, diff, show,
     rev-parse, ls-files, and any verb not on the denylist.
@@ -87,7 +90,6 @@ MUTATING_VERBS = frozenset(
         "am",
         "apply",
         "stash",
-        "notes",
         "tag",
         "worktree",
         "clean",
@@ -108,6 +110,28 @@ MUTATING_VERBS = frozenset(
         "submodule",
     }
 )
+
+# `git notes` reads with `list`, `show`, or `get-ref` (or bare, which lists);
+# every other subcommand (add, append, copy, edit, merge, remove, prune) writes
+# to the notes ref. `--ref` consumes the following token as its value.
+NOTES_READ_SUBCOMMANDS = frozenset({"list", "show", "get-ref"})
+
+
+def notes_is_mutating(rest: list[str]) -> bool:
+    """True if a `git notes` invocation writes; unknown subcommands count as
+    writes (default-deny). Bare `git notes` lists and is read-only."""
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--ref":
+            i += 2  # flag + its value
+            continue
+        if tok.startswith("-"):
+            i += 1  # boolean flag or `--ref=value`
+            continue
+        return tok not in NOTES_READ_SUBCOMMANDS
+    return False
+
 
 # `git branch` lists branches (read) with no args; it mutates only with these.
 BRANCH_DESTRUCTIVE_FLAGS = frozenset(
@@ -206,6 +230,8 @@ def offending_git_verb(command: str) -> str | None:
             return verb
         if verb == "branch" and any(f in BRANCH_DESTRUCTIVE_FLAGS for f in rest):
             return "branch"
+        if verb == "notes" and notes_is_mutating(rest):
+            return "notes"
     return None
 
 
