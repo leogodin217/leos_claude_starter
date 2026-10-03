@@ -20,17 +20,31 @@ They do **not** survive a reboot (tmux dies). After a reboot, a session can be m
 ~/.claude/skills/remote-session/rsession spawn <name> <dir> [prompt...]
 ~/.claude/skills/remote-session/rsession peek  <name> [scrollback-lines]
 ~/.claude/skills/remote-session/rsession send  <name> <text...>
+~/.claude/skills/remote-session/rsession state <name>
+~/.claude/skills/remote-session/rsession wait  <name> [timeout-secs]
 ~/.claude/skills/remote-session/rsession ls
 ~/.claude/skills/remote-session/rsession kill  <name>
 ```
 
 `spawn` launches claude in `<dir>` (with `--dangerously-skip-permissions`, plus `<dir>/.claude/*-system-prompt.md` as `--system-prompt-file` if one exists — the per-repo convention), waits for the TUI, sends `/remote-control <name>`, and prints the captured claude.ai URL. If `[prompt...]` is given it is sent after registration, so the session starts working immediately.
 
+`state` classifies the session from the bottom of its screen:
+
+| State | Meaning |
+|---|---|
+| `busy` | spinner or running tool on screen |
+| `background` | turn ended, but background shells/agents will wake it (footer `· 1 shell`) |
+| `dialog` | a question or permission prompt is waiting for an answer |
+| `idle` | turn over, nothing pending — waiting for a message |
+| `exited` / `gone` | claude exited (pane dead) / no such tmux session |
+
+`wait` blocks until the session needs someone, then prints why and exits: `idle` 0, `dialog` 2, `exited`/`gone` 3, `timeout (<state>)` 124 (default timeout 1800s). It waits through `busy` and `background`. `idle` and `dialog` must hold for `RSESSION_SETTLE` polls (default 3, ~6s at a 2s poll), so a `wait` started right after `send` or a keypress doesn't return on the stale screen.
+
 ## Workflow
 
 1. **Spawn** with a task: `rsession spawn forge-triage ~/projects/forge "triage the open QA findings"`.
 2. **Relay the URL to the user** — that link is theirs; it outlives you.
-3. **Monitor sparingly** if asked: `peek` every few minutes, or a background poll loop. The user may equally drive the session directly — don't assume you're the only input.
+3. **Watch with `wait`** if asked: run `rsession wait <name>` as a background Bash command (`run_in_background`) — you get one notification when the session needs input, then `peek` to read what it said. Re-run after each `send`. The user may equally drive the session directly from claude.ai — don't assume you're the only input.
 4. **Relay/forward** with `send` when the user answers through you.
 5. **Kill** only when the user confirms the session's work is done.
 
