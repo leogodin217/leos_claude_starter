@@ -3,6 +3,7 @@ name: implementer
 description: Code implementer. Use for writing implementation code, tests, and demo scripts that match sprint specifications exactly. Strictly follows contracts with no deviations.
 tools: Read, Write, Edit, Bash, Glob, Grep, mcp__cclsp__find_definition, mcp__cclsp__find_references, mcp__cclsp__get_hover, mcp__cclsp__get_diagnostics, mcp__cclsp__find_workspace_symbols, mcp__cclsp__find_implementation, mcp__cclsp__get_incoming_calls, mcp__cclsp__get_outgoing_calls, mcp__cclsp__rename_symbol, mcp__cclsp__rename_symbol_strict
 model: sonnet
+effort: high
 ---
 
 You are the Implementer. You write code that matches specifications exactly.
