@@ -1,126 +1,75 @@
 #!/usr/bin/env python3
-"""Claude Code session analyzer. Search, summarize, and extract session data.
+"""Claude Code session analyzer: find, summarize, and audit session transcripts.
 
-Usage:
-    analyzer.py list [--project SLUG] [--recent N] [--all]
-    analyzer.py search KEYWORD [--project SLUG] [--recent N] [--all] [--verbose]
-    analyzer.py find NAME [--project SLUG] [--recent N] [--all]
-    analyzer.py summary SESSION_PATH [--deep] [--verbose]
-    analyzer.py conversation SESSION_PATH [--max-chars N]
-    analyzer.py tools SESSION_PATH
-    analyzer.py diff SESSION_A SESSION_B
+SESSION arguments accept a .jsonl path (subagent transcripts too), `self` (the
+calling session, via $CLAUDE_CODE_SESSION_ID), a session UUID or unique prefix,
+`pr:N` / `pr:owner/repo#N` (session linked to that PR), or a title (/rename
+name or auto title). Session commands also take --search KEYWORD --index N.
+
+Run `analyzer.py <command> -h` for a command's options.
 """
 
+import argparse
 import json
 import os
-import sys
 import re
+import sys
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
-from collections import defaultdict
 from pathlib import Path
 
 CLAUDE_DIR = Path.home() / ".claude"
 PROJECTS_DIR = CLAUDE_DIR / "projects"
+REGISTRY_DIR = CLAUDE_DIR / "sessions"
 
 KNOWN_TYPES = {
-    "user", "assistant", "custom-title", "progress",
-    "queue-operation", "file-history-snapshot", "system",
-    "last-prompt",
+    "user", "assistant", "attachment", "system", "progress", "summary",
+    "queue-operation", "file-history-snapshot", "file-history-delta",
+    "custom-title", "ai-title", "agent-name", "last-prompt", "mode",
+    "permission-mode", "atis-latch", "pr-link", "bridge-session", "cost-state",
 }
 
+# Built-ins that configure a session rather than describe its work; never used as its label.
+CONFIG_COMMANDS = {
+    "/add-dir", "/agents", "/bashes", "/btw", "/clear", "/compact", "/config", "/context",
+    "/copy", "/cost", "/doctor", "/effort", "/exit", "/export", "/fast", "/help", "/hooks",
+    "/ide", "/login", "/logout", "/mcp", "/memory", "/model", "/output-style",
+    "/permissions", "/plugin", "/remote-control", "/rename", "/resume", "/rewind",
+    "/status", "/statusline", "/tasks", "/terminal-setup", "/theme", "/usage", "/vim",
+}
 
-# --- Parsing helpers ---
+WRITE_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 
-def load_jsonl(path):
-    messages = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                messages.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
-    return messages
+# Bash commands that look like they modify files (heuristic; used with a filename match).
+BASH_WRITE_RE = re.compile(
+    r"sed\s+-i|perl\s+-\w*i|\btee\b|\b(?:git\s+)?(?:mv|cp|rm)\s|(?<![\d&])>>?\s*(?!&)[^\s&|]"
+    r"|open\([^)]*['\"][wa]|write_text|apply_patch|\bpatch\b"
+)
 
+# Whole-word matches; a trailing * matches as a prefix.
+SIGNALS = {
+    "backtracking": ["actually", "wait", "wrong", "mistake*", "let me reconsider", "should have"],
+    "spec-deviation": ["spec says", "not what the spec", "different approach", "intentional*", "skip*", "omit*"],
+    "rework": ["revert*", "undo", "let me try", "didn't work", "failed"],
+    "workaround": ["circular", "lazy import", "workaround*", "hack*"],
+    "scope-creep": ["refactor*", "restructur*", "redesign*", "not implement*"],
+}
 
-def get_role(msg):
-    """Get the role of a message. Tries msg['type'] then msg['message']['role'].
-
-    Works consistently regardless of whether the JSONL format stores role at
-    the top level (type field) or nested under message.role.
-    """
-    t = msg.get("type")
-    if t in ("user", "assistant"):
-        return t
-    inner = msg.get("message")
-    if isinstance(inner, dict):
-        return inner.get("role", "")
-    return ""
-
-
-def get_timestamp(msg):
-    val = msg.get("timestamp")
-    if val is None:
-        return None
-    if isinstance(val, (int, float)):
-        return datetime.fromtimestamp(val / 1000 if val > 1e12 else val, tz=timezone.utc)
-    if isinstance(val, str):
-        try:
-            return datetime.fromisoformat(val.replace("Z", "+00:00"))
-        except ValueError:
-            pass
-    return None
+NOISE_RE = re.compile(
+    r"<(system-reminder|local-command-caveat|local-command-stdout|local-command-stderr|"
+    r"task-notification|command-message)>.*?</\1>",
+    re.S,
+)
 
 
-def extract_text(content):
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, str):
-                parts.append(block)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                parts.append(block.get("text", ""))
-        return "\n".join(parts)
-    return ""
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(1)
 
 
-def extract_tool_uses(content):
-    if not isinstance(content, list):
-        return []
-    return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+# --- Formatting ---
 
-
-def extract_tool_results(content):
-    if not isinstance(content, list):
-        return []
-    return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
-
-
-def get_tool_target(tool_block):
-    inp = tool_block.get("input", {})
-    for key in ("command", "file_path", "pattern", "query", "url", "skill"):
-        if key in inp:
-            val = inp[key]
-            if key == "pattern":
-                return f"{inp.get('path', '.')} :: {val}"
-            if key == "skill":
-                return f"skill:{val}"
-            return val[:120] if len(val) > 120 else val
-    for k, v in inp.items():
-        if isinstance(v, str) and v:
-            return f"{k}={v[:80]}"
-    return "(no target)"
-
-
-def sizeof(obj):
-    return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
-
-
-def format_bytes(b):
+def fmt_bytes(b):
     if b < 1024:
         return f"{b} B"
     if b < 1024 * 1024:
@@ -128,1004 +77,958 @@ def format_bytes(b):
     return f"{b / (1024 * 1024):.2f} MB"
 
 
-def format_duration(seconds):
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
+def fmt_dur(seconds):
+    seconds = int(seconds)
+    h, m, s = seconds // 3600, seconds % 3600 // 60, seconds % 60
     if h:
-        return f"{h}h {m}m {s}s"
+        return f"{h}h {m}m"
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
 
 
-def find_snippets(text, keyword, max_snippets=5, context_chars=40):
-    """Find keyword matches with surrounding context (~80 chars total)."""
-    snippets = []
-    text_lower = text.lower()
-    keyword_lower = keyword.lower()
-    start = 0
-    while len(snippets) < max_snippets:
-        pos = text_lower.find(keyword_lower, start)
-        if pos == -1:
-            break
-        snippet_start = max(0, pos - context_chars)
-        snippet_end = min(len(text), pos + len(keyword) + context_chars)
-        snippet = text[snippet_start:snippet_end].replace("\n", " ").strip()
-        if snippet_start > 0:
-            snippet = "..." + snippet
-        if snippet_end < len(text):
-            snippet = snippet + "..."
-        snippets.append(snippet)
-        start = pos + len(keyword)
-    return snippets
+def fmt_cost(cost_state):
+    return f"${cost_state['totalCostUSD']:.2f}" if cost_state else ""
 
 
-def get_session_aux_content(session_path):
-    """Read externalized tool results and subagent transcripts for a session.
-
-    Returns (tool_result_texts, subagent_texts) — lists of strings.
-    """
-    session_dir = Path(session_path).with_suffix("")
-
-    tool_result_texts = []
-    tool_results_dir = session_dir / "tool-results"
-    if tool_results_dir.exists():
-        for f in tool_results_dir.iterdir():
-            if f.is_file():
-                try:
-                    tool_result_texts.append(f.read_text(encoding="utf-8", errors="replace"))
-                except Exception:
-                    pass
-
-    subagent_texts = []
-    subagents_dir = session_dir / "subagents"
-    if subagents_dir.exists():
-        for f in sorted(subagents_dir.glob("*.jsonl")):
-            try:
-                subagent_texts.append(f.read_text(encoding="utf-8", errors="replace"))
-            except Exception:
-                pass
-
-    return tool_result_texts, subagent_texts
+def fmt_when(ts, with_date=True):
+    if ts is None:
+        return "?"
+    return ts.astimezone().strftime("%Y-%m-%d %H:%M" if with_date else "%H:%M:%S")
 
 
-# --- Session discovery ---
-
-def find_all_sessions(project_slug=None, recent=20, all_sessions=False):
-    """Find session JSONL files, sorted newest first."""
-    sessions = []
-    if project_slug:
-        search_dirs = [PROJECTS_DIR / project_slug]
-    else:
-        search_dirs = [d for d in PROJECTS_DIR.iterdir() if d.is_dir()]
-
-    for proj_dir in search_dirs:
-        if not proj_dir.exists():
-            continue
-        for f in proj_dir.glob("*.jsonl"):
-            stat = f.stat()
-            sessions.append({
-                "path": str(f),
-                "project": proj_dir.name,
-                "session_id": f.stem,
-                "size": stat.st_size,
-                "mtime": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
-            })
-
-    sessions.sort(key=lambda s: s["mtime"], reverse=True)
-    if all_sessions:
-        return sessions
-    return sessions[:recent]
+def one_line(text, n):
+    text = " ".join(text.split())
+    if len(text) <= n:
+        return text
+    return "…" + text[-(n - 1):] if text.startswith("/") else text[: n - 1] + "…"  # paths keep their tail
 
 
-def get_custom_title(path):
-    """Extract customTitle from a session file. Returns the last title (most recent rename)."""
-    title = ""
-    with open(path, "r", encoding="utf-8") as f:
+# --- Entry parsing ---
+
+def load(path):
+    entries = []
+    with open(path, encoding="utf-8") as f:
         for line in f:
-            if '"custom-title"' in line:
-                try:
-                    msg = json.loads(line.strip())
-                    if msg.get("type") == "custom-title":
-                        title = msg.get("customTitle", "")
-                except json.JSONDecodeError:
-                    pass
-    return title
-
-
-def get_session_preview(path):
-    """Get first user prompt and basic info without full parse."""
-    first_user_text = ""
-    command_name = ""
-    custom_title = ""
-    version = ""
-    model = ""
-    first_ts = None
-    last_ts = None
-
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
             try:
-                msg = json.loads(line)
+                e = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(e, dict):
+                entries.append(e)
+    return entries
 
-            ts = get_timestamp(msg)
-            if ts:
-                if first_ts is None:
-                    first_ts = ts
-                last_ts = ts
 
-            if not version and msg.get("version"):
-                version = msg["version"]
+def parse_ts(val):
+    if isinstance(val, (int, float)):
+        return datetime.fromtimestamp(val / 1000 if val > 1e12 else val, tz=timezone.utc)
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None
 
-            if msg.get("type") == "custom-title":
-                custom_title = msg.get("customTitle", "")
 
-            inner = msg.get("message", {})
-            if isinstance(inner, dict):
-                if not model and inner.get("model"):
-                    model = inner["model"]
+def content_of(e):
+    msg = e.get("message")
+    return msg.get("content", []) if isinstance(msg, dict) else []
 
-            role = get_role(msg)
-            if role == "user":
-                text = extract_text(inner.get("content", "")) if isinstance(inner, dict) else ""
-                if "<command-name>" in text:
-                    m = re.search(r"<command-name>(/[^<]+)</command-name>", text)
-                    if m:
-                        cmd = m.group(1).strip()
-                        if cmd not in ("/clear", "/resume", "/exit"):
-                            if not command_name:
-                                command_name = cmd
-                if not first_user_text:
-                    clean = re.sub(r"<[^>]+>[^<]*</[^>]+>", "", text)
-                    clean = re.sub(r"<[^>]+>", "", clean).strip()
-                    if clean and len(clean) > 5 and "Caveat:" not in clean and "tool_result" not in text:
-                        first_user_text = clean[:200]
 
-    return {
-        "first_prompt": first_user_text,
-        "command": command_name,
-        "custom_title": custom_title,
-        "version": version,
-        "model": model,
-        "started": first_ts,
-        "last_activity": last_ts,
+def extract_text(content, thinking=False):
+    if isinstance(content, str):
+        return content
+    parts = []
+    for b in content if isinstance(content, list) else []:
+        if isinstance(b, str):
+            parts.append(b)
+        elif isinstance(b, dict) and b.get("type") == "text":
+            parts.append(b.get("text", ""))
+        elif thinking and isinstance(b, dict) and b.get("type") == "thinking":
+            parts.append(b.get("thinking", ""))
+    return "\n".join(parts)
+
+
+def blocks(content, kind):
+    return [b for b in content if isinstance(b, dict) and b.get("type") == kind] if isinstance(content, list) else []
+
+
+def clean_prompt(text):
+    m = re.search(r"<command-name>(/[^<]+)</command-name>", text)
+    if m:
+        a = re.search(r"<command-args>(.*?)</command-args>", text, re.S)
+        return f"{m.group(1).strip()} {a.group(1).strip() if a else ''}".strip()
+    text = NOISE_RE.sub("", text)
+    return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def human_prompt(e):
+    """Text of a prompt a person typed (or a slash command they ran), else None.
+
+    Current versions mark the source in `origin.kind`; older transcripts lack it
+    and fall back to filtering out tool results, meta entries, and notifications.
+    """
+    if e.get("type") != "user" or e.get("isMeta"):
+        return None
+    content = content_of(e)
+    if blocks(content, "tool_result"):
+        return None
+    origin = e.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") != "human":
+        return None
+    text = extract_text(content)
+    if text.lstrip().startswith("<task-notification"):
+        return None
+    clean = clean_prompt(text)
+    if not clean or clean.startswith("Caveat:"):
+        return None
+    return clean
+
+
+def is_notification(e):
+    if e.get("type") != "user":
+        return False
+    origin = e.get("origin")
+    if isinstance(origin, dict):
+        return origin.get("kind") == "task-notification"
+    return extract_text(content_of(e)).lstrip().startswith("<task-notification")
+
+
+def tool_target(tu):
+    inp = tu.get("input") or {}
+    if "pattern" in inp:
+        return f"{inp.get('path', '.')} :: {inp['pattern']}"
+    if "skill" in inp:
+        return f"skill:{inp['skill']}"
+    if tu.get("name") == "Agent" and "description" in inp:
+        return f"{inp.get('subagent_type', 'general-purpose')}: {inp['description']}"
+    for key in ("command", "file_path", "notebook_path", "query", "url", "prompt"):
+        if isinstance(inp.get(key), str):
+            return one_line(inp[key], 120)
+    for k, v in inp.items():
+        if isinstance(v, str) and v:
+            return f"{k}={one_line(v, 80)}"
+    return "(no target)"
+
+
+def sizeof(obj):
+    return len(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+
+# --- Transcript analysis ---
+
+def analyze(path):
+    """Full pass over one transcript (main session or subagent)."""
+    s = {
+        "path": str(path), "size": os.path.getsize(path), "first_ts": None, "last_ts": None,
+        "prompts": [], "command": "", "custom_title": "", "ai_title": "", "agent_name": "",
+        "models": Counter(), "version": "", "cwd": "", "branch": "",
+        "tokens": Counter(), "tokens_by_model": defaultdict(Counter),
+        "calls": [], "tools": [], "types": Counter(), "skills": [], "recaps": [],
+        "active_s": 0, "cost": None, "prs": {},
     }
+    seen_msgs = set()
+    tools_by_id = {}
+    driver = "human"
+    pending = []  # tool results that arrived since the previous API call
+    turn_start = turn_last = prev_last = None  # active time: each prompt to its turn's last user/assistant entry
 
-
-# --- Stats extraction (shared by summary, diff, deep) ---
-
-def extract_session_stats(path, verbose=False):
-    """Extract comprehensive stats from a session JSONL. Returns a dict."""
-    messages = load_jsonl(path)
-    file_size = os.path.getsize(path)
-
-    stats = {
-        "path": path,
-        "file_size": file_size,
-        "timestamps": [],
-        "user_prompts": [],
-        "tool_counts": defaultdict(int),
-        "tool_result_bytes": defaultdict(int),
-        "tool_use_details": [],
-        "msg_type_counts": defaultdict(int),
-        "total_input_tokens": 0,
-        "total_output_tokens": 0,
-        "total_cache_read": 0,
-        "total_cache_create": 0,
-        "tokens_by_model": defaultdict(lambda: {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0}),
-        "model": "",
-        "version": "",
-        "command": "",
-        "custom_title": "",
-        "skills_invoked": [],
-        "files_touched": set(),
-        "unknown_types": set(),
-        "subagent_count": 0,
-        "subagent_total_size": 0,
-    }
-
-    tool_use_map = {}
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-
-        ts = get_timestamp(msg)
+    for e in load(path):
+        t = e.get("type", "(none)")
+        s["types"][t] += 1
+        ts = parse_ts(e.get("timestamp"))
         if ts:
-            stats["timestamps"].append(ts)
+            s["first_ts"] = s["first_ts"] or ts
+            s["last_ts"] = ts
+        if ts and t in ("user", "assistant"):
+            prev_last, turn_last = turn_last, ts
+        s["version"] = e.get("version") or s["version"]
+        s["cwd"] = e.get("cwd") or s["cwd"]
+        s["branch"] = e.get("gitBranch") or s["branch"]
 
-        msg_type = msg.get("type", "(none)")
-        stats["msg_type_counts"][msg_type] += 1
+        if t == "custom-title":
+            s["custom_title"] = e.get("customTitle", "")
+        elif t == "ai-title":
+            s["ai_title"] = e.get("aiTitle", "")
+        elif t == "agent-name":
+            s["agent_name"] = e.get("agentName", "")
+        elif t == "pr-link":
+            s["prs"][e.get("prUrl")] = e.get("prNumber")
+        elif t == "cost-state":
+            s["cost"] = e
+        elif t == "system" and e.get("subtype") == "away_summary":
+            s["recaps"].append((ts, e.get("content", "")))
+        elif t == "user":
+            prompt = human_prompt(e)
+            if prompt:
+                s["prompts"].append((ts, prompt))
+                driver = "human"
+                if turn_start and prev_last:
+                    s["active_s"] += (prev_last - turn_start).total_seconds()
+                turn_start = ts
+                cmd = prompt.split()[0]
+                if cmd.startswith("/") and cmd not in CONFIG_COMMANDS and not s["command"]:
+                    s["command"] = cmd
+            elif is_notification(e):
+                driver = "notification"
+            for tr in blocks(content_of(e), "tool_result"):
+                tool = tools_by_id.get(tr.get("tool_use_id"))
+                if tool:
+                    tool["result_bytes"] = sizeof(tr.get("content", ""))
+                    pending.append(tool)
+        elif t == "assistant":
+            msg = e.get("message") or {}
+            model = msg.get("model", "")
+            usage = msg.get("usage")
+            # Each content block is its own entry with the response's usage repeated; count it once.
+            key = msg.get("id") or e.get("requestId") or e.get("uuid")
+            if usage and key not in seen_msgs:
+                seen_msgs.add(key)
+                u = {
+                    "input": usage.get("input_tokens", 0),
+                    "output": usage.get("output_tokens", 0),
+                    "cache_read": usage.get("cache_read_input_tokens", 0),
+                    "cache_create": usage.get("cache_creation_input_tokens", 0),
+                }
+                s["tokens"].update(u)
+                if model and model != "<synthetic>":
+                    s["models"][model] += 1
+                    s["tokens_by_model"][model].update(u)
+                s["calls"].append({
+                    "ts": ts, "context": u["input"] + u["cache_read"] + u["cache_create"],
+                    "output": u["output"], "driver": driver, "after": pending,
+                })
+                pending = []
+            for tu in blocks(msg.get("content", []), "tool_use"):
+                rec = {
+                    "id": tu.get("id"), "name": tu.get("name", "?"), "target": tool_target(tu),
+                    "input": tu.get("input") or {}, "ts": ts, "result_bytes": 0,
+                }
+                s["tools"].append(rec)
+                tools_by_id[rec["id"]] = rec
+                if rec["name"] == "Skill":
+                    s["skills"].append(rec["input"].get("skill", ""))
+    if turn_start and turn_last:
+        s["active_s"] += (turn_last - turn_start).total_seconds()
+    return s
 
-        if msg_type not in KNOWN_TYPES and msg_type != "(none)":
-            stats["unknown_types"].add(msg_type)
 
-        if not stats["version"] and msg.get("version"):
-            stats["version"] = msg["version"]
+MARKERS = ('"type":"custom-title"', '"type":"ai-title"', '"type":"agent-name"',
+           '"type":"pr-link"', '"type":"cost-state"')
 
-        if msg.get("type") == "custom-title":
-            stats["custom_title"] = msg.get("customTitle", "")
 
-        inner = msg.get("message", msg)
-        if not isinstance(inner, dict):
+def peek(path):
+    """Cheap pass for listings: titles, label, PRs, cost, project. Parses only lines it needs."""
+    info = {"custom_title": "", "ai_title": "", "agent_name": "", "command": "", "prompt": "",
+            "prs": {}, "cost": None, "cwd": ""}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            is_user = '"type":"user"' in line
+            wanted = (
+                any(m in line for m in MARKERS)
+                or not info["cwd"]
+                or (is_user and not info["prompt"])
+                or (is_user and not info["command"] and "<command-name>" in line)
+            )
+            if not wanted:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = e.get("type")
+            info["cwd"] = info["cwd"] or e.get("cwd", "")
+            if t == "custom-title":
+                info["custom_title"] = e.get("customTitle", "")
+            elif t == "ai-title":
+                info["ai_title"] = e.get("aiTitle", "")
+            elif t == "agent-name":
+                info["agent_name"] = e.get("agentName", "")
+            elif t == "pr-link":
+                info["prs"][e.get("prUrl")] = e.get("prNumber")
+            elif t == "cost-state":
+                info["cost"] = e
+            elif t == "user":
+                prompt = human_prompt(e)
+                cmd = prompt.split()[0] if prompt else ""
+                if prompt and cmd not in CONFIG_COMMANDS:
+                    info["prompt"] = info["prompt"] or prompt
+                    if cmd.startswith("/") and not info["command"]:
+                        info["command"] = cmd
+    return info
+
+
+def titles(info):
+    return [t for t in (info["custom_title"], info["agent_name"], info["ai_title"]) if t]
+
+
+def label(info):
+    """Display name: /rename title, else auto title, else first real command, else first prompt."""
+    name = (titles(info) or [""])[0]
+    if name and info["command"]:
+        return f"{name} ({info['command']})"
+    return name or info["command"] or one_line(info["prompt"], 60)
+
+
+def subagents(path):
+    """Subagent transcripts of a session in start order, labeled from their .meta.json."""
+    d = Path(path).with_suffix("") / "subagents"
+    out = []
+    for f in sorted(d.glob("*.jsonl")) if d.is_dir() else []:
+        meta = {}
+        meta_path = f.with_suffix(".meta.json")
+        if meta_path.exists():
+            meta = json.loads(meta_path.read_text())
+        out.append({
+            "path": f,
+            "type": meta.get("agentType", "?"),
+            "description": meta.get("description", ""),
+            "label": f"{meta.get('agentType', '?')}: {meta.get('description', '')}".rstrip(": "),
+            "start": json.loads(f.open(encoding="utf-8").readline() or "{}").get("timestamp", ""),
+        })
+    return sorted(out, key=lambda a: a["start"])
+
+
+# --- Session discovery and resolution ---
+
+def project_slug(project):
+    if project == "." or "/" in project:
+        return re.sub(r"[^A-Za-z0-9]", "-", os.path.abspath(project))
+    return project
+
+
+def session_files(project=None):
+    if project:
+        dirs = [PROJECTS_DIR / project_slug(project)]
+    else:
+        dirs = [d for d in PROJECTS_DIR.iterdir() if d.is_dir()]
+    files = [f for d in dirs if d.is_dir() for f in d.glob("*.jsonl")]
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return files
+
+
+def windowed(files, args):
+    return files if args.all or args.recent is None else files[: args.recent]
+
+
+def project_name(path, info):
+    return os.path.basename(info["cwd"]) if info["cwd"] else Path(path).parent.name
+
+
+def mtime(path):
+    return datetime.fromtimestamp(Path(path).stat().st_mtime, tz=timezone.utc)
+
+
+def print_session_rows(rows, extra=None):
+    """rows: [(path, info)]. `extra(i)` returns lines printed under row i."""
+    print(f"{'#':<3} {'Last active':<16} {'Size':>9} {'Cost':>7}  {'Project':<24} {'ID':<8}  Label")
+    for i, (path, info) in enumerate(rows):
+        prs = " ".join(f"PR#{n}" for n in info["prs"].values())
+        print(f"{i:<3} {fmt_when(mtime(path)):<16} {fmt_bytes(Path(path).stat().st_size):>9} "
+              f"{fmt_cost(info['cost']):>7}  {one_line(project_name(path, info), 24):<24} "
+              f"{Path(path).stem[:8]:<8}  {label(info) or '(empty)'}{'  ' + prs if prs else ''}")
+        for line in extra(i) if extra else []:
+            print(line)
+
+
+def pick_one(matches, what):
+    if len(matches) == 1:
+        return str(matches[0][0])
+    if not matches:
+        die(f"No session matches {what}.")
+    print(f"Multiple sessions match {what}:", file=sys.stderr)
+    for path, info in matches[:20]:
+        print(f"  {Path(path).stem[:8]}  {fmt_when(mtime(path))}  {label(info)}  {path}", file=sys.stderr)
+    die("Use a longer ID prefix or the full path.")
+
+
+def resolve(session, args):
+    if getattr(args, "search", None) is not None:
+        if args.index is None:
+            die("--search needs --index N (see `search` output).")
+        matches = run_search(args.search, windowed(session_files(args.project), args))
+        if not 0 <= args.index < len(matches):
+            die(f"Index {args.index} out of range ({len(matches)} matches).")
+        return matches[args.index]["path"]
+    if session is None:
+        die("No session given. Pass a path, `self`, UUID/prefix, pr:N, title, or --search KW --index N.")
+
+    if session == "self":
+        session = os.environ.get("CLAUDE_CODE_SESSION_ID") or die(
+            "`self` needs $CLAUDE_CODE_SESSION_ID (only set inside a Claude Code session).")
+    if os.path.isfile(session):
+        return session
+
+    m = re.fullmatch(r"pr:(?:([\w.-]+/[\w.-]+)#)?(\d+)", session)
+    if m:
+        repo, number = m.group(1), int(m.group(2))
+        hits = []
+        for f in session_files():
+            info = peek(f)
+            if any(n == number and (not repo or f"/{repo}/pull/" in url) for url, n in info["prs"].items()):
+                hits.append((f, info))
+        return pick_one(hits, f"PR {session[3:]}")
+
+    if re.fullmatch(r"[0-9a-f-]{4,36}", session):
+        hits = sorted(PROJECTS_DIR.glob(f"*/{session}*.jsonl"))
+        if hits:
+            return pick_one([(f, peek(f)) for f in hits], f"ID {session}")
+
+    needle = session.lower()
+    exact, partial = [], []
+    for f in session_files():
+        info = peek(f)
+        names = [t.lower() for t in titles(info)]
+        if needle in names:
+            exact.append((f, info))
+        elif any(needle in n for n in names):
+            partial.append((f, info))
+    return pick_one(exact or partial, f'"{session}"')
+
+
+# --- Commands: finding sessions ---
+
+def registry_alive(d):
+    pid = d.get("pid")
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():
+        # Field 22 (starttime) guards against a reused pid; fields after the ")" start at 3.
+        start = stat.read_text().rsplit(")", 1)[1].split()[19]
+        return d.get("procStart") in (None, start)
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def cmd_live(args):
+    me = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    rows = []
+    for f in REGISTRY_DIR.glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
             continue
+        if registry_alive(d):
+            rows.append(d)
+    if not rows:
+        print("No running Claude Code sessions.")
+        return
+    rows.sort(key=lambda d: d.get("updatedAt", 0), reverse=True)
+    now = datetime.now(timezone.utc)
+    print(f"{'PID':<8} {'Status':<14} {'Name':<28} {'ID':<8}  {'Cwd':<40} Label")
+    for d in rows:
+        since = parse_ts(d.get("statusUpdatedAt"))
+        status = d.get("status", "?") + (f" {fmt_dur((now - since).total_seconds())}" if since else "")
+        if d.get("kind") not in (None, "interactive"):
+            status += f" ({d['kind']})"
+        hits = list(PROJECTS_DIR.glob(f"*/{d.get('sessionId')}.jsonl"))
+        lbl = label(peek(hits[0])) if hits else ""
+        mark = "  <- self" if d.get("sessionId") == me else ""
+        print(f"{d.get('pid', '?'):<8} {status:<14} {one_line(d.get('name', ''), 28):<28} "
+              f"{d.get('sessionId', '')[:8]:<8}  {one_line(d.get('cwd', ''), 40):<40} {lbl}{mark}")
 
-        role = get_role(msg)
-        content = inner.get("content", [])
-
-        msg_model = inner.get("model", "")
-        if not stats["model"] and msg_model:
-            stats["model"] = msg_model
-
-        usage = inner.get("usage", {})
-        if usage:
-            inp = usage.get("input_tokens", 0)
-            out = usage.get("output_tokens", 0)
-            cr = usage.get("cache_read_input_tokens", 0)
-            cc = usage.get("cache_creation_input_tokens", 0)
-            stats["total_input_tokens"] += inp
-            stats["total_output_tokens"] += out
-            stats["total_cache_read"] += cr
-            stats["total_cache_create"] += cc
-            if msg_model:
-                bucket = stats["tokens_by_model"][msg_model]
-                bucket["input"] += inp
-                bucket["output"] += out
-                bucket["cache_read"] += cr
-                bucket["cache_create"] += cc
-
-        if role == "assistant":
-            for tu in extract_tool_uses(content):
-                name = tu.get("name", "unknown")
-                stats["tool_counts"][name] += 1
-                tid = tu.get("id", "")
-                target = get_tool_target(tu)
-                tool_use_map[tid] = {"name": name, "target": target}
-                if name == "Skill":
-                    skill_name = tu.get("input", {}).get("skill", "")
-                    if skill_name:
-                        stats["skills_invoked"].append(skill_name)
-                # Track files touched by Read/Write/Edit
-                if name in ("Read", "Write", "Edit"):
-                    fp = tu.get("input", {}).get("file_path", "")
-                    if fp:
-                        stats["files_touched"].add(fp)
-
-        if role == "user":
-            text = extract_text(content)
-            if "<command-name>" in text:
-                m = re.search(r"<command-name>(/[^<]+)</command-name>", text)
-                if m:
-                    cmd = m.group(1).strip()
-                    if cmd not in ("/clear", "/resume", "/exit") and not stats["command"]:
-                        stats["command"] = cmd
-            if text.strip() and "<tool_result" not in text and "tool_result" not in str(content)[:50]:
-                clean = re.sub(r"<[^>]+>[^<]*</[^>]+>", "", text)
-                clean = re.sub(r"<[^>]+>", "", clean).strip()
-                if clean and len(clean) > 5 and "Caveat:" not in clean:
-                    stats["user_prompts"].append({"text": clean, "ts": ts})
-
-            for tr in extract_tool_results(content):
-                tid = tr.get("tool_use_id", "")
-                result_size = sizeof(tr.get("content", ""))
-                if tid in tool_use_map:
-                    info = tool_use_map[tid]
-                    stats["tool_result_bytes"][info["name"]] += result_size
-                    stats["tool_use_details"].append((info["name"], info["target"], result_size))
-
-    # Subagent info
-    session_dir = Path(path).with_suffix("") / "subagents"
-    if session_dir.exists():
-        agent_files = list(session_dir.glob("*.jsonl"))
-        stats["subagent_count"] = len(agent_files)
-        stats["subagent_total_size"] = sum(f.stat().st_size for f in agent_files)
-
-    if verbose and stats["unknown_types"]:
-        print(f"  [verbose] Unknown JSONL types in {Path(path).name}: {', '.join(sorted(stats['unknown_types']))}")
-
-    return stats
-
-
-def print_summary(stats):
-    """Print a formatted summary from stats dict."""
-    print("=" * 70)
-    print("SESSION SUMMARY")
-    print("=" * 70)
-    print(f"  Path:     {stats['path']}")
-    print(f"  Size:     {format_bytes(stats['file_size'])}")
-    if stats["custom_title"]:
-        print(f"  Name:     {stats['custom_title']}")
-    if stats["command"]:
-        print(f"  Command:  {stats['command']}")
-    print(f"  Model:    {stats['model'] or '?'}")
-    print(f"  Version:  {stats['version'] or '?'}")
-
-    if stats["timestamps"]:
-        first_ts = min(stats["timestamps"])
-        last_ts = max(stats["timestamps"])
-        duration = (last_ts - first_ts).total_seconds()
-        print(f"  Started:  {first_ts.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-        print(f"  Ended:    {last_ts.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-        print(f"  Duration: {format_duration(duration)}")
-
-    print(f"\n--- Tokens ---")
-    print(f"  Input:        {stats['total_input_tokens']:>10,}")
-    print(f"  Output:       {stats['total_output_tokens']:>10,}")
-    print(f"  Cache read:   {stats['total_cache_read']:>10,}")
-    print(f"  Cache create: {stats['total_cache_create']:>10,}")
-
-    by_model = stats.get("tokens_by_model", {})
-    if len(by_model) > 1:
-        print(f"\n--- Tokens by model ---")
-        for model_name in sorted(by_model):
-            b = by_model[model_name]
-            print(f"  {model_name}:")
-            print(f"    Input:        {b['input']:>10,}")
-            print(f"    Output:       {b['output']:>10,}")
-            print(f"    Cache read:   {b['cache_read']:>10,}")
-            print(f"    Cache create: {b['cache_create']:>10,}")
-
-    total_tool_calls = sum(stats["tool_counts"].values())
-    print(f"\n--- Tools ({total_tool_calls} calls) ---")
-    for name in sorted(stats["tool_counts"], key=lambda n: stats["tool_counts"][n], reverse=True):
-        c = stats["tool_counts"][name]
-        b = stats["tool_result_bytes"].get(name, 0)
-        print(f"  {name:<25} {c:>4}x  {format_bytes(b):>10} results")
-
-    if stats["skills_invoked"]:
-        print(f"\n--- Skills invoked ---")
-        for s in stats["skills_invoked"]:
-            print(f"  /{s}")
-
-    print(f"\n--- Message types ---")
-    for mt, c in sorted(stats["msg_type_counts"].items(), key=lambda x: x[1], reverse=True):
-        print(f"  {mt}: {c}")
-
-    if stats["subagent_count"]:
-        print(f"\n--- Subagents: {stats['subagent_count']} ---")
-        print(f"  Total subagent data: {format_bytes(stats['subagent_total_size'])}")
-
-    print(f"\n--- User prompts ({len(stats['user_prompts'])}) ---")
-    for p in stats["user_prompts"]:
-        ts_str = p["ts"].strftime("%H:%M:%S") if p["ts"] else "?"
-        text = p["text"][:120].replace("\n", " ")
-        print(f"  [{ts_str}] {text}")
-
-    # Top 5 largest tool results
-    details = sorted(stats["tool_use_details"], key=lambda x: x[2], reverse=True)
-    if details:
-        print(f"\n--- Top 5 largest tool results ---")
-        for name, target, size in details[:5]:
-            target_short = target[:70] if len(target) > 70 else target
-            print(f"  {format_bytes(size):>10}  {name}: {target_short}")
-
-    print(f"\n{'=' * 70}")
-
-
-# --- Commands ---
 
 def cmd_list(args):
-    project = args.get("project")
-    recent = int(args.get("recent", 20))
-    all_flag = args.get("all", False)
-    sessions = find_all_sessions(project_slug=project, recent=recent, all_sessions=all_flag)
-
-    if not sessions:
+    rows = [(f, peek(f)) for f in windowed(session_files(args.project), args)]
+    shown = [(f, i) for f, i in rows if label(i)]
+    if not shown:
         print("No sessions found.")
         return
-
-    print(f"{'#':<4} {'Date':<20} {'Size':>8}  {'Project':<40} {'Command/Prompt'}")
-    print(f"{'─'*4} {'─'*20} {'─'*8}  {'─'*40} {'─'*40}")
-
-    for i, s in enumerate(sessions):
-        preview = get_session_preview(s["path"])
-        date_str = s["mtime"].strftime("%Y-%m-%d %H:%M")
-        size_str = format_bytes(s["size"])
-        title = preview["custom_title"]
-        label = title or preview["command"] or preview["first_prompt"][:50] or "(empty)"
-        if title and preview["command"]:
-            label = f"[{title}] {preview['command']}"
-        proj = s["project"]
-        if len(proj) > 40:
-            proj = "..." + proj[-37:]
-        print(f"{i:<4} {date_str:<20} {size_str:>8}  {proj:<40} {label}")
-
-    print(f"\n{len(sessions)} sessions shown. Use 'summary <path>' for details.")
-    print(f"Session dir: {PROJECTS_DIR}/")
+    print_session_rows(shown)
+    hidden = len(rows) - len(shown)
+    print(f"\n{len(shown)} sessions" + (f" ({hidden} empty stubs hidden)" if hidden else "") +
+          ". Pass the ID to summary/agents/efficiency/etc.")
 
 
-def run_search(args):
-    """Run search and return sorted matches. Searches main JSONL, externalized tool results, and subagent transcripts."""
-    keyword = args["keyword"]
-    project = args.get("project")
-    recent = int(args.get("recent", 50))
-    all_flag = args.get("all", False)
-    verbose = args.get("verbose", False)
-    sessions = find_all_sessions(project_slug=project, recent=recent, all_sessions=all_flag)
-
-    keyword_lower = keyword.lower()
+def cmd_find(args):
+    needle = args.name.lower()
     matches = []
-    for s in sessions:
-        try:
-            with open(s["path"], "r", encoding="utf-8") as f:
-                main_content = f.read()
-        except Exception:
-            continue
+    for f in windowed(session_files(args.project), args):
+        info = peek(f)
+        if any(needle in t.lower() for t in titles(info)):
+            matches.append((f, info))
+    if not matches:
+        print(f'No session titled like "{args.name}" (checks /rename names and auto titles).')
+        return
+    print_session_rows(matches[:20])
+    if len(matches) == 1:
+        print(f"\nResume: claude --resume {Path(matches[0][0]).stem}")
 
-        # Collect text sources: (label, text)
-        sources = [("main", main_content)]
 
-        tool_result_texts, subagent_texts = get_session_aux_content(s["path"])
-        for t in tool_result_texts:
-            sources.append(("tool-result", t))
-        for t in subagent_texts:
-            sources.append(("subagent", t))
+def find_snippets(text, keyword, limit=3, ctx=40):
+    out, low, kw, start = [], text.lower(), keyword.lower(), 0
+    while len(out) < limit:
+        pos = low.find(kw, start)
+        if pos == -1:
+            break
+        a, b = max(0, pos - ctx), min(len(text), pos + len(kw) + ctx)
+        snippet = text[a:b].replace("\\n", " ").replace('\\"', '"')  # raw JSONL escapes
+        out.append(("..." if a else "") + one_line(snippet, 400) + ("..." if b < len(text) else ""))
+        start = pos + len(kw)
+    return out
 
-        total_hits = 0
-        all_snippets = []
-        for label, text in sources:
-            hits = text.lower().count(keyword_lower)
-            if hits:
-                total_hits += hits
-                snippets = find_snippets(text, keyword, max_snippets=3, context_chars=40)
-                for snip in snippets:
-                    all_snippets.append((label, snip))
 
-        if total_hits:
-            preview = get_session_preview(s["path"])
-            if verbose:
-                # Check for unknown types in main content
-                for line in main_content.split("\n"):
-                    if not line.strip():
-                        continue
-                    try:
-                        msg = json.loads(line)
-                        t = msg.get("type")
-                        if t and t not in KNOWN_TYPES:
-                            print(f"  [verbose] Unknown type '{t}' in {Path(s['path']).name}")
-                            break  # one warning per session
-                    except (json.JSONDecodeError, AttributeError):
-                        pass
-            matches.append({**s, "hits": total_hits, "preview": preview, "snippets": all_snippets[:8]})
-
+def run_search(keyword, files):
+    """Sessions containing keyword in the main JSONL, externalized tool results, or subagents."""
+    kw = keyword.lower()
+    matches = []
+    for f in files:
+        sources = [("", f.read_text(encoding="utf-8", errors="replace"))]
+        results_dir = f.with_suffix("") / "tool-results"
+        if results_dir.is_dir():
+            sources += [("[tool-result]", r.read_text(encoding="utf-8", errors="replace"))
+                        for r in results_dir.iterdir() if r.is_file()]
+        sources += [(f"[{a['type']}]", a["path"].read_text(encoding="utf-8", errors="replace"))
+                    for a in subagents(f)]
+        hits, snippets = 0, []
+        for tag, text in sources:
+            n = text.lower().count(kw)
+            if n:
+                hits += n
+                snippets += [(tag, s) for s in find_snippets(text, keyword)]
+        if hits:
+            matches.append({"path": str(f), "hits": hits, "snippets": snippets[:3]})
     matches.sort(key=lambda m: m["hits"], reverse=True)
     return matches
 
 
-def resolve_search_index(args):
-    """Resolve --search KEYWORD --index N to a session path."""
-    index = int(args["index"])
-    matches = run_search(args)
-    if not matches:
-        print(f'No sessions containing "{args["keyword"]}".')
-        return None
-    if index < 0 or index >= len(matches):
-        print(f"Index {index} out of range (0-{len(matches)-1}).")
-        return None
-    return matches[index]["path"]
-
-
 def cmd_search(args):
-    matches = run_search(args)
-
+    matches = run_search(args.keyword, windowed(session_files(args.project), args))
     if not matches:
-        print(f'No sessions containing "{args["keyword"]}".')
+        print(f'No sessions contain "{args.keyword}".')
         return
-
-    # --index N: print just the path of the Nth result
-    if "index" in args:
-        index = int(args["index"])
-        if index < 0 or index >= len(matches):
-            print(f"Index {index} out of range (0-{len(matches)-1}).")
-            return
-        print(matches[index]["path"])
+    if args.index is not None:
+        if not 0 <= args.index < len(matches):
+            die(f"Index {args.index} out of range ({len(matches)} matches).")
+        print(matches[args.index]["path"])
         return
+    top = matches[:20]
+    print(f'Sessions containing "{args.keyword}" ({len(matches)}, most hits first):\n')
+    print_session_rows(
+        [(m["path"], peek(m["path"])) for m in top],
+        extra=lambda i: [f"      {top[i]['hits']} hits"] +
+                        [f"      {tag} {snip}".rstrip() for tag, snip in top[i]["snippets"]],
+    )
 
-    print(f'Sessions matching "{args["keyword"]}" ({len(matches)} found):\n')
-    print(f"{'#':<4} {'Hits':>5} {'Date':<20} {'Size':>8}  {'Command/Prompt'}")
-    print(f"{'─'*4} {'─'*5} {'─'*20} {'─'*8}  {'─'*40}")
 
-    for i, m in enumerate(matches[:20]):
-        date_str = m["mtime"].strftime("%Y-%m-%d %H:%M")
-        size_str = format_bytes(m["size"])
-        title = m["preview"]["custom_title"]
-        label = title or m["preview"]["command"] or m["preview"]["first_prompt"][:50] or "(empty)"
-        if title and m["preview"]["command"]:
-            label = f"[{title}] {m['preview']['command']}"
-        print(f"{i:<4} {m['hits']:>5} {date_str:<20} {size_str:>8}  {label}")
+def cmd_provenance(args):
+    target = os.path.abspath(args.file) if os.path.exists(args.file) else None
+    needle = os.path.basename(args.file.rstrip("/"))
 
-        # Show context snippets
-        for source, snippet in m.get("snippets", [])[:3]:
-            tag = f"[{source}]" if source != "main" else ""
-            print(f"       {tag} {snippet}")
+    def matches(fp):
+        return fp == target if target else args.file in fp
 
-    print(f"\nPaths:")
-    for i, m in enumerate(matches[:20]):
-        print(f"  {i}: {m['path']}")
+    rows = []
+    for f in windowed(session_files(args.project), args):
+        transcripts = [(f, "main")] + [(a["path"], a["label"]) for a in subagents(f)]
+        for tpath, who in transcripts:
+            with open(tpath, encoding="utf-8") as fh:
+                for line in fh:
+                    if needle not in line or '"tool_use"' not in line:
+                        continue
+                    e = json.loads(line)
+                    for tu in blocks(content_of(e), "tool_use"):
+                        inp = tu.get("input") or {}
+                        fp = inp.get("file_path") or inp.get("notebook_path") or ""
+                        if tu.get("name") in WRITE_TOOLS and matches(fp):
+                            detail = inp.get("new_string") or inp.get("content") or inp.get("new_source") or ""
+                            rows.append((parse_ts(e.get("timestamp")), f, who, tu["name"], fp, detail))
+                        cmd = inp.get("command") or ""
+                        if tu.get("name") == "Bash" and needle in cmd and BASH_WRITE_RE.search(cmd):
+                            rows.append((parse_ts(e.get("timestamp")), f, who, "Bash?", "", cmd))
+    if not rows:
+        print(f"No writes of {args.file} found.")
+        return
+    rows.sort(key=lambda r: r[0] or datetime.min.replace(tzinfo=timezone.utc))
+    labels = {}
+    for ts, f, who, tool, fp, detail in rows:
+        if f not in labels:
+            labels[f] = label(peek(f))
+        print(f"{fmt_when(ts)}  {Path(f).stem[:8]}  {one_line(labels[f], 40):<40}  {one_line(who, 30):<30}  "
+              f"{tool:<6} {fp if not target else ''}")
+        print(f"      {one_line(detail, 110)}")
+    print(f"\n{len(rows)} writes across {len(labels)} sessions. `Bash?` rows are commands naming the file "
+          f"that look like writes (heuristic).")
 
-    print(f"\nTip: use 'search \"{args['keyword']}\" --index N' to get a path, or 'summary --search \"{args['keyword']}\" --index N' directly.")
+
+# --- Commands: one session ---
+
+def peak(s):
+    return max((c["context"] for c in s["calls"]), default=0)
+
+
+def wall(s):
+    return (s["last_ts"] - s["first_ts"]).total_seconds() if s["first_ts"] else 0
+
+
+def print_tokens(tokens, indent="  "):
+    for k, name in (("input", "Input"), ("output", "Output"), ("cache_read", "Cache read"),
+                    ("cache_create", "Cache create")):
+        print(f"{indent}{name + ':':<14}{tokens[k]:>14,}")
 
 
 def cmd_summary(args):
-    path = resolve_session_path(args.get("session"), args=args)
-    if not path:
+    path = resolve(args.session, args)
+    s = analyze(path)
+    print("=" * 70)
+    print(f"SESSION {Path(path).stem}")
+    print("=" * 70)
+    first = next((p for _, p in s["prompts"] if p.split()[0] not in CONFIG_COMMANDS), "")
+    print(f"  Label:    {label({**s, 'prompt': first}) or '(none)'}")
+    print(f"  Path:     {path}  ({fmt_bytes(s['size'])})")
+    print(f"  Cwd:      {s['cwd']}  [{s['branch']}]")
+    print(f"  Models:   {', '.join(s['models']) or '?'}   Version: {s['version'] or '?'}")
+    print(f"  Started:  {fmt_when(s['first_ts'])}   Last: {fmt_when(s['last_ts'])}")
+    print(f"  Time:     {fmt_dur(wall(s))} wall-clock, {fmt_dur(s['active_s'])} active (prompt to end of each turn)")
+    if s["cost"]:
+        print(f"  Cost:     {fmt_cost(s['cost'])} (session total incl. subagents)")
+    for url in s["prs"]:
+        print(f"  PR:       {url}")
+
+    print(f"\n--- Tokens ({len(s['calls'])} API calls, peak context {peak(s):,}) ---")
+    print_tokens(s["tokens"])
+    if len(s["tokens_by_model"]) > 1:
+        for model, t in sorted(s["tokens_by_model"].items()):
+            print(f"  {model}:")
+            print_tokens(t, indent="    ")
+
+    counts = Counter(t["name"] for t in s["tools"])
+    result_bytes = Counter()
+    for t in s["tools"]:
+        result_bytes[t["name"]] += t["result_bytes"]
+    print(f"\n--- Tools ({len(s['tools'])} calls) ---")
+    for name, c in counts.most_common():
+        print(f"  {name:<36} {c:>4}x  {fmt_bytes(result_bytes[name]):>10} results")
+    if s["skills"]:
+        print(f"\n--- Skills invoked: {', '.join('/' + k for k in s['skills'])}")
+    agents = subagents(path)
+    if agents:
+        print(f"\n--- Subagents: {len(agents)} (`agents {Path(path).stem[:8]}` for the table) ---")
+
+    print(f"\n--- Human prompts ({len(s['prompts'])}) ---")
+    for ts, text in s["prompts"]:
+        print(f"  [{fmt_when(ts, with_date=False)}] {one_line(text, 120)}")
+
+    biggest = sorted(s["tools"], key=lambda t: t["result_bytes"], reverse=True)[:5]
+    if biggest and biggest[0]["result_bytes"]:
+        print("\n--- Largest tool results ---")
+        for t in biggest:
+            print(f"  {fmt_bytes(t['result_bytes']):>10}  {t['name']}: {one_line(t['target'], 70)}")
+
+    if args.verbose:
+        print("\n--- Entry types ---")
+        for t, c in s["types"].most_common():
+            print(f"  {t}: {c}{'   (unknown to analyzer)' if t not in KNOWN_TYPES else ''}")
+
+    if s["recaps"]:
+        ts, text = s["recaps"][-1]
+        print(f"\n--- Latest recap ({fmt_when(ts)}) ---\n{text}")
+    else:
+        for e in reversed(load(path)):
+            text = extract_text(content_of(e)) if e.get("type") == "assistant" else ""
+            if text.strip():
+                print(f"\n--- Last assistant message ---\n{text[:400]}" +
+                      (f"\n... [{len(text)} chars]" if len(text) > 400 else ""))
+                break
+
+    if args.deep and agents:
+        stats = [analyze(a["path"]) for a in agents]
+        everything = [s] + stats
+        total = Counter()
+        for x in everything:
+            total.update(x["tokens"])
+        tools = Counter(t["name"] for x in everything for t in x["tools"])
+        starts = [x["first_ts"] for x in everything if x["first_ts"]]
+        ends = [x["last_ts"] for x in everything if x["last_ts"]]
+        print(f"\n{'=' * 70}\nDEEP: session + {len(stats)} subagents, "
+              f"{fmt_dur((max(ends) - min(starts)).total_seconds())} combined span\n{'=' * 70}")
+        print_tokens(total)
+        print(f"\n--- Tools across all transcripts ({sum(tools.values())} calls) ---")
+        for name, c in tools.most_common():
+            print(f"  {name:<36} {c:>4}x")
+        print()
+        print_agent_table(agents, stats)
+
+
+def print_agent_table(agents, stats):
+    print(f"{'#':<3} {'Start':<8} {'Agent':<46} {'Model':<18} {'Time':>7} {'Tools':>5} "
+          f"{'Out tok':>9} {'Peak ctx':>9} {'Size':>9}  File")
+    for n, (a, s) in enumerate(zip(agents, stats)):
+        model = ",".join(m.replace("claude-", "") for m in s["models"])
+        print(f"{n:<3} {fmt_when(s['first_ts'], with_date=False)[:8]:<8} {one_line(a['label'], 46):<46} "
+              f"{one_line(model, 18):<18} {fmt_dur(wall(s)):>7} {len(s['tools']):>5} "
+              f"{s['tokens']['output']:>9,} {peak(s):>9,} {fmt_bytes(s['size']):>9}  {a['path'].stem}")
+
+
+def cmd_agents(args):
+    path = resolve(args.session, args)
+    agents = subagents(path)
+    if not agents:
+        print("No subagent transcripts for this session.")
         return
-
-    verbose = args.get("verbose", False)
-    deep = args.get("deep", False)
-
-    stats = extract_session_stats(path, verbose=verbose)
-    print_summary(stats)
-
-    if not deep:
-        # Show last assistant message (as before)
-        _print_last_assistant_message(path)
-        return
-
-    # --deep: aggregate parent + all subagent transcripts
-    session_dir = Path(path).with_suffix("") / "subagents"
-    if not session_dir.exists() or not list(session_dir.glob("*.jsonl")):
-        print("\nNo subagent transcripts found for --deep aggregation.")
-        _print_last_assistant_message(path)
-        return
-
-    agent_files = sorted(session_dir.glob("*.jsonl"))
-    subagent_stats_list = []
-    for f in agent_files:
-        try:
-            subagent_stats_list.append(extract_session_stats(str(f), verbose=verbose))
-        except Exception as e:
-            if verbose:
-                print(f"  [verbose] Failed to parse {f.name}: {e}")
-
-    # Aggregated totals
-    agg_input = stats["total_input_tokens"] + sum(s["total_input_tokens"] for s in subagent_stats_list)
-    agg_output = stats["total_output_tokens"] + sum(s["total_output_tokens"] for s in subagent_stats_list)
-    agg_cache_read = stats["total_cache_read"] + sum(s["total_cache_read"] for s in subagent_stats_list)
-    agg_cache_create = stats["total_cache_create"] + sum(s["total_cache_create"] for s in subagent_stats_list)
-    agg_tools = sum(stats["tool_counts"].values()) + sum(sum(s["tool_counts"].values()) for s in subagent_stats_list)
-
-    # Aggregated tokens by model
-    agg_by_model = defaultdict(lambda: {"input": 0, "output": 0, "cache_read": 0, "cache_create": 0})
-    for src in [stats] + subagent_stats_list:
-        for model_name, bucket in src.get("tokens_by_model", {}).items():
-            agg = agg_by_model[model_name]
-            agg["input"] += bucket["input"]
-            agg["output"] += bucket["output"]
-            agg["cache_read"] += bucket["cache_read"]
-            agg["cache_create"] += bucket["cache_create"]
-
-    # Combined tool counts
-    combined_tools = defaultdict(int, stats["tool_counts"])
-    for s in subagent_stats_list:
-        for name, count in s["tool_counts"].items():
-            combined_tools[name] += count
-
-    # Combined duration across all transcripts
-    all_timestamps = list(stats["timestamps"])
-    for s in subagent_stats_list:
-        all_timestamps.extend(s["timestamps"])
-    combined_duration = 0
-    if all_timestamps:
-        combined_duration = (max(all_timestamps) - min(all_timestamps)).total_seconds()
-
-    print(f"\n{'=' * 70}")
-    print(f"DEEP AGGREGATION (parent + {len(subagent_stats_list)} subagents)")
-    print(f"{'=' * 70}")
-    print(f"  Combined duration: {format_duration(combined_duration)}")
-
-    print(f"\n--- Aggregated tokens ---")
-    print(f"  Input:        {agg_input:>10,}")
-    print(f"  Output:       {agg_output:>10,}")
-    print(f"  Cache read:   {agg_cache_read:>10,}")
-    print(f"  Cache create: {agg_cache_create:>10,}")
-
-    if len(agg_by_model) > 1:
-        print(f"\n--- Aggregated tokens by model ---")
-        for model_name in sorted(agg_by_model):
-            b = agg_by_model[model_name]
-            print(f"  {model_name}:")
-            print(f"    Input:        {b['input']:>10,}")
-            print(f"    Output:       {b['output']:>10,}")
-            print(f"    Cache read:   {b['cache_read']:>10,}")
-            print(f"    Cache create: {b['cache_create']:>10,}")
-
-    print(f"\n--- Aggregated tools ({agg_tools} calls) ---")
-    for name in sorted(combined_tools, key=lambda n: combined_tools[n], reverse=True):
-        print(f"  {name:<25} {combined_tools[name]:>4}x")
-
-    print(f"\n--- Per-subagent breakdown ---")
-    print(f"  {'#':<4} {'Model':<28} {'Duration':<12} {'Tools':>6} {'In tokens':>12} {'Out tokens':>12} {'Size':>10}  {'File'}")
-    print(f"  {'─'*4} {'─'*28} {'─'*12} {'─'*6} {'─'*12} {'─'*12} {'─'*10}  {'─'*30}")
-    for i, s in enumerate(subagent_stats_list):
-        dur = ""
-        if s["timestamps"]:
-            dur = format_duration((max(s["timestamps"]) - min(s["timestamps"])).total_seconds())
-        tc = sum(s["tool_counts"].values())
-        name = Path(s["path"]).stem[:30]
-        model_short = s.get("model", "?") or "?"
-        print(f"  {i:<4} {model_short:<28} {dur:<12} {tc:>6} {s['total_input_tokens']:>12,} {s['total_output_tokens']:>12,} {format_bytes(s['file_size']):>10}  {name}")
-
-    print(f"\n{'=' * 70}")
-
-
-def _print_last_assistant_message(path):
-    """Print the last assistant message from a session (used by summary)."""
-    messages = load_jsonl(path)
-    for msg in reversed(messages):
-        if not isinstance(msg, dict):
-            continue
-        if get_role(msg) == "assistant":
-            inner = msg.get("message", msg)
-            if isinstance(inner, dict):
-                text = extract_text(inner.get("content", ""))
-                if text.strip():
-                    print(f"\n--- Last assistant message (truncated) ---")
-                    print(text[:400])
-                    if len(text) > 400:
-                        print(f"... [{len(text)} chars total]")
-                    break
+    print_agent_table(agents, [analyze(a["path"]) for a in agents])
+    print(f"\nTranscripts: {Path(path).with_suffix('')}/subagents/<File>.jsonl "
+          "(pass a path to summary/tools/signals/efficiency)")
 
 
 def cmd_conversation(args):
-    """Extract the conversation flow (user prompts + assistant text responses)."""
-    path = resolve_session_path(args.get("session"), args=args)
-    if not path:
-        return
-
-    max_chars = int(args.get("max_chars", 500))
-    messages = load_jsonl(path)
-
+    path = resolve(args.session, args)
     turn = 0
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-
-        role = get_role(msg)
-        if not role:
-            continue
-
-        inner = msg.get("message", msg)
-        if not isinstance(inner, dict):
-            continue
-        content = inner.get("content", [])
-        ts = get_timestamp(msg)
-        ts_str = ts.strftime("%H:%M:%S") if ts else "?"
-
-        if role == "user":
-            text = extract_text(content)
-            clean = re.sub(r"<[^>]+>", "", text).strip()
-            if not clean or len(clean) < 3:
-                continue
-            if isinstance(content, list) and all(
-                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
-            ):
-                continue
+    for e in load(path):
+        ts = fmt_when(parse_ts(e.get("timestamp")), with_date=False)
+        prompt = human_prompt(e)
+        if prompt:
             turn += 1
-            print(f"\n{'─' * 60}")
-            print(f"USER [{ts_str}] (turn {turn})")
-            print(f"{'─' * 60}")
-            truncated = clean[:max_chars]
-            print(truncated)
-            if len(clean) > max_chars:
-                print(f"... [{len(clean)} chars]")
-
-        elif role == "assistant":
-            text = extract_text(content)
-            if not text.strip():
-                continue
-            tools = extract_tool_uses(content)
-            tool_summary = ""
-            if tools:
-                names = [t.get("name", "?") for t in tools]
-                tool_summary = f" [tools: {', '.join(names)}]"
-
-            print(f"\nASSISTANT [{ts_str}]{tool_summary}")
-            truncated = text[:max_chars]
-            print(truncated)
-            if len(text) > max_chars:
-                print(f"... [{len(text)} chars]")
+            print(f"\n{'─' * 60}\nUSER [{ts}] (turn {turn})\n{'─' * 60}")
+            print(prompt[: args.max_chars] + (f"\n... [{len(prompt)} chars]" if len(prompt) > args.max_chars else ""))
+        elif is_notification(e):
+            text = extract_text(content_of(e))
+            m = re.search(r"<summary>(.*?)</summary>", text, re.S)
+            print(f"\n[notification {ts}] {one_line(m.group(1) if m else clean_prompt(text), 150)}")
+        elif e.get("type") == "assistant":
+            text = extract_text(content_of(e))
+            if text.strip():
+                print(f"\nASSISTANT [{ts}]")
+                print(text[: args.max_chars] + (f"\n... [{len(text)} chars]" if len(text) > args.max_chars else ""))
 
 
 def cmd_tools(args):
-    """Detailed tool usage timeline."""
-    path = resolve_session_path(args.get("session"), args=args)
-    if not path:
-        return
+    s = analyze(resolve(args.session, args))
+    print(f"Tool timeline ({len(s['tools'])} calls):\n")
+    for t in s["tools"]:
+        print(f"  [{fmt_when(t['ts'], with_date=False)}] {t['name']:<18} {fmt_bytes(t['result_bytes']):>9}  "
+              f"{one_line(t['target'], 90)}")
 
-    messages = load_jsonl(path)
-    tool_timeline = []
 
-    for msg in messages:
-        if not isinstance(msg, dict):
+def transcripts(path):
+    """[(label, stats)] for a session and its subagents."""
+    return [("main", analyze(path))] + [(a["label"], analyze(a["path"])) for a in subagents(path)]
+
+
+def cmd_signals(args):
+    path = resolve(args.session, args)
+    if args.words:
+        groups = {"custom": [w.strip() for w in args.words.split(",") if w.strip()]}
+    else:
+        groups = {k: v for k, v in SIGNALS.items() if not args.category or k in args.category}
+    patterns = {
+        k: re.compile("|".join(r"\b" + re.escape(w[:-1]) if w.endswith("*") else r"\b" + re.escape(w) + r"\b"
+                               for w in ws), re.I)
+        for k, ws in groups.items()
+    }
+
+    sources = [("main", path)] + [(a["label"], a["path"]) for a in subagents(path)]
+    report = []
+    for who, tpath in sources:
+        found = defaultdict(list)
+        for e in load(tpath):
+            if e.get("type") != "assistant":
+                continue
+            text = extract_text(content_of(e), thinking=True)
+            for cat, pat in patterns.items():
+                for m in pat.finditer(text):
+                    a, b = max(0, m.start() - 60), min(len(text), m.end() + 100)
+                    found[cat].append((parse_ts(e.get("timestamp")), m.group(0), one_line(text[a:b], 200)))
+        report.append((who, found))
+
+    cats = list(groups)
+    print(f"{'Transcript':<50} " + " ".join(f"{c[:14]:>14}" for c in cats))
+    for who, found in report:
+        print(f"{one_line(who, 50):<50} " + " ".join(f"{len(found[c]):>14}" for c in cats))
+    for who, found in report:
+        if not any(found.values()):
             continue
-        if get_role(msg) != "assistant":
-            continue
-        inner = msg.get("message", msg)
-        if not isinstance(inner, dict):
-            continue
-        content = inner.get("content", [])
-        ts = get_timestamp(msg)
+        print(f"\n=== {who}")
+        for cat in cats:
+            hits = found[cat]
+            if not hits:
+                continue
+            print(f"  -- {cat} ({len(hits)}{', showing ' + str(args.limit) if len(hits) > args.limit else ''})")
+            for ts, word, snip in hits[: args.limit]:
+                print(f"    [{fmt_when(ts, with_date=False)}] «{word}» {snip}")
 
-        for tu in extract_tool_uses(content):
-            tool_timeline.append({
-                "ts": ts,
-                "name": tu.get("name", "?"),
-                "target": get_tool_target(tu),
-                "id": tu.get("id", ""),
-            })
 
-    print(f"Tool usage timeline ({len(tool_timeline)} calls):\n")
-    for t in tool_timeline:
-        ts_str = t["ts"].strftime("%H:%M:%S") if t["ts"] else "?"
-        target = t["target"][:80] if len(t["target"]) > 80 else t["target"]
-        print(f"  [{ts_str}] {t['name']:<20} {target}")
+def cmd_efficiency(args):
+    path = resolve(args.session, args)
+    ts_list = transcripts(path)
+    main = ts_list[0][1]
+
+    print("--- Per transcript ---")
+    print(f"{'Transcript':<46} {'Calls':>5} {'Peak ctx':>9} {'Ctx re-read':>12} {'Cache hit':>9} {'Output':>8}")
+    for who, s in ts_list:
+        t = s["tokens"]
+        fed = t["input"] + t["cache_read"] + t["cache_create"]
+        hit = f"{t['cache_read'] / fed:.0%}" if fed else "-"
+        print(f"{one_line(who, 46):<46} {len(s['calls']):>5} {peak(s):>9,} "
+              f"{sum(c['context'] for c in s['calls']):>12,} {hit:>9} {t['output']:>8,}")
+
+    calls = main["calls"]
+    if calls:
+        print(f"\n--- Main context growth ({len(calls)} calls) ---")
+        step = max(1, len(calls) // 12)
+        top = peak(main) or 1
+        for i in list(range(0, len(calls), step)) + ([len(calls) - 1] if (len(calls) - 1) % step else []):
+            c = calls[i]
+            print(f"  #{i:<5} {fmt_when(c['ts'], with_date=False)}  {c['context']:>9,}  {'█' * round(30 * c['context'] / top)}")
+        spikes = sorted(
+            ((calls[i]["context"] - calls[i - 1]["context"], i) for i in range(1, len(calls))), reverse=True)[:5]
+        print("\n  Largest jumps (and the tool results that fed them):")
+        for delta, i in spikes:
+            if delta <= 0:
+                break
+            fed = ", ".join(f"{t['name']} {fmt_bytes(t['result_bytes'])} {one_line(t['target'], 40)}"
+                            for t in sorted(calls[i]["after"], key=lambda t: -t["result_bytes"])[:2])
+            print(f"  +{delta:>8,} at #{i} {fmt_when(calls[i]['ts'], with_date=False)}  {fed or '(user prompt / attachments)'}")
+
+    print("\n--- Repeated reads within a transcript ---")
+    any_dup = False
+    for who, s in ts_list:
+        reads = [t for t in s["tools"] if t["name"] == "Read"]
+        per_path = Counter(t["input"].get("file_path") for t in reads)
+        dups = [(p, n) for p, n in per_path.most_common() if n > 1]
+        if dups:
+            any_dup = True
+            print(f"  {who}")
+            for p, n in dups[:10]:
+                same = [t for t in reads if t["input"].get("file_path") == p]
+                ranges = len({(t["input"].get("offset"), t["input"].get("limit")) for t in same})
+                kind = "same range" if ranges == 1 else f"{ranges} ranges"
+                print(f"    {n}x {fmt_bytes(sum(t['result_bytes'] for t in same)):>9}  ({kind})  {p}")
+    if not any_dup:
+        print("  none")
+
+    readers = defaultdict(set)
+    read_bytes = Counter()
+    for who, s in ts_list:
+        for t in s["tools"]:
+            if t["name"] == "Read":
+                readers[t["input"].get("file_path")].add(who)
+                read_bytes[t["input"].get("file_path")] += t["result_bytes"]
+    shared = sorted((p for p in readers if len(readers[p]) > 1), key=lambda p: -read_bytes[p])
+    print("\n--- Files read by several transcripts (candidates to pre-extract) ---")
+    for p in shared[:15]:
+        print(f"  {len(readers[p]):>2} readers {fmt_bytes(read_bytes[p]):>9}  {p}")
+    if not shared:
+        print("  none")
+
+    print("\n--- Largest tool results (all transcripts) ---")
+    every = [(t, who) for who, s in ts_list for t in s["tools"]]
+    for t, who in sorted(every, key=lambda x: -x[0]["result_bytes"])[:10]:
+        print(f"  {fmt_bytes(t['result_bytes']):>9}  {t['name']:<8} {one_line(t['target'], 55):<55}  [{one_line(who, 30)}]")
+
+    notif = [c for c in calls if c["driver"] == "notification"]
+    print(f"\n--- Notification-driven turns (main) ---\n  {len(notif)} of {len(calls)} API calls were triggered "
+          f"by background-task/subagent notifications, not a prompt: {sum(c['context'] for c in notif):,} context "
+          f"tokens re-read, {sum(c['output'] for c in notif):,} output tokens.\n  Expected while orchestrating; "
+          f"waste once the work was already reported done.")
 
 
 def cmd_diff(args):
-    """Compare two sessions side-by-side."""
-    path_a = resolve_session_path(args.get("session_a"))
-    if not path_a:
-        print("Could not resolve first session.")
-        return
-    path_b = resolve_session_path(args.get("session_b"))
-    if not path_b:
-        print("Could not resolve second session.")
-        return
+    pa, pb = resolve(args.session_a, args), resolve(args.session_b, args)
+    a, b = analyze(pa), analyze(pb)
 
-    verbose = args.get("verbose", False)
-    stats_a = extract_session_stats(path_a, verbose=verbose)
-    stats_b = extract_session_stats(path_b, verbose=verbose)
+    def row(name, va, vb, fmt=lambda v: f"{v:,}"):
+        d = vb - va
+        delta = "—" if not d else ("+" if d > 0 else "-") + fmt(abs(d))
+        print(f"  {name:<18} {fmt(va):>14} {fmt(vb):>14} {delta:>14}")
 
-    def dur(stats):
-        if stats["timestamps"]:
-            return (max(stats["timestamps"]) - min(stats["timestamps"])).total_seconds()
-        return 0
+    print(f"A: {pa}\nB: {pb}\n")
+    print(f"  {'Metric':<18} {'A':>14} {'B':>14} {'Delta':>14}")
+    row("Wall-clock", wall(a), wall(b), fmt_dur)
+    row("Active", a["active_s"], b["active_s"], fmt_dur)
+    if a["cost"] and b["cost"]:
+        row("Cost (USD)", a["cost"]["totalCostUSD"], b["cost"]["totalCostUSD"], lambda v: f"{v:.2f}")
+    row("API calls", len(a["calls"]), len(b["calls"]))
+    row("Peak context", peak(a), peak(b))
+    for k in ("input", "output", "cache_read", "cache_create"):
+        row(k.replace("_", " ").capitalize(), a["tokens"][k], b["tokens"][k])
+    row("Tool calls", len(a["tools"]), len(b["tools"]))
+    row("Human prompts", len(a["prompts"]), len(b["prompts"]))
+    row("Subagents", len(subagents(pa)), len(subagents(pb)))
 
-    def delta_str(a, b, fmt_fn=None):
-        d = b - a
-        if d == 0:
-            return "—"
-        sign = "+" if d > 0 else "-"
-        fn = fmt_fn or str
-        return f"{sign}{fn(abs(d))}"
+    ca, cb = Counter(t["name"] for t in a["tools"]), Counter(t["name"] for t in b["tools"])
+    print(f"\n  {'Tool':<18} {'A':>14} {'B':>14} {'Delta':>14}")
+    for name in sorted(set(ca) | set(cb)):
+        row(name, ca[name], cb[name])
 
-    dur_a = dur(stats_a)
-    dur_b = dur(stats_b)
-    tools_a = sum(stats_a["tool_counts"].values())
-    tools_b = sum(stats_b["tool_counts"].values())
+    def touched(s):
+        return {t["input"].get("file_path") for t in s["tools"] if t["name"] in WRITE_TOOLS | {"Read"}} - {None}
 
-    print("=" * 80)
-    print("SESSION COMPARISON")
-    print("=" * 80)
-    print(f"  A: {path_a}")
-    print(f"  B: {path_b}")
-
-    print(f"\n{'Metric':<22} {'A':>14} {'B':>14} {'Delta':>14}")
-    print(f"{'─'*22} {'─'*14} {'─'*14} {'─'*14}")
-
-    rows = [
-        ("Duration", format_duration(dur_a), format_duration(dur_b), delta_str(dur_a, dur_b, lambda d: format_duration(abs(d)))),
-        ("File size", format_bytes(stats_a["file_size"]), format_bytes(stats_b["file_size"]), delta_str(stats_a["file_size"], stats_b["file_size"], lambda d: format_bytes(abs(d)))),
-        ("Input tokens", f"{stats_a['total_input_tokens']:,}", f"{stats_b['total_input_tokens']:,}", delta_str(stats_a['total_input_tokens'], stats_b['total_input_tokens'], lambda d: f"{abs(d):,}")),
-        ("Output tokens", f"{stats_a['total_output_tokens']:,}", f"{stats_b['total_output_tokens']:,}", delta_str(stats_a['total_output_tokens'], stats_b['total_output_tokens'], lambda d: f"{abs(d):,}")),
-        ("Cache read", f"{stats_a['total_cache_read']:,}", f"{stats_b['total_cache_read']:,}", delta_str(stats_a['total_cache_read'], stats_b['total_cache_read'], lambda d: f"{abs(d):,}")),
-        ("Cache create", f"{stats_a['total_cache_create']:,}", f"{stats_b['total_cache_create']:,}", delta_str(stats_a['total_cache_create'], stats_b['total_cache_create'], lambda d: f"{abs(d):,}")),
-        ("Tool calls", str(tools_a), str(tools_b), delta_str(tools_a, tools_b, lambda d: str(abs(d)))),
-        ("User prompts", str(len(stats_a['user_prompts'])), str(len(stats_b['user_prompts'])), delta_str(len(stats_a['user_prompts']), len(stats_b['user_prompts']), lambda d: str(abs(d)))),
-        ("Subagents", str(stats_a['subagent_count']), str(stats_b['subagent_count']), delta_str(stats_a['subagent_count'], stats_b['subagent_count'], lambda d: str(abs(d)))),
-    ]
-
-    for label, va, vb, d in rows:
-        print(f"  {label:<20} {va:>14} {vb:>14} {d:>14}")
-
-    # Tool breakdown
-    all_tools = sorted(set(list(stats_a["tool_counts"].keys()) + list(stats_b["tool_counts"].keys())))
-    if all_tools:
-        print(f"\n{'Tool':<22} {'A':>14} {'B':>14} {'Delta':>14}")
-        print(f"{'─'*22} {'─'*14} {'─'*14} {'─'*14}")
-        for name in all_tools:
-            ca = stats_a["tool_counts"].get(name, 0)
-            cb = stats_b["tool_counts"].get(name, 0)
-            print(f"  {name:<20} {ca:>14} {cb:>14} {delta_str(ca, cb, lambda d: str(abs(d))):>14}")
-
-    # Files touched
-    files_a = stats_a["files_touched"]
-    files_b = stats_b["files_touched"]
-    only_a = files_a - files_b
-    only_b = files_b - files_a
-    both = files_a & files_b
-
-    if files_a or files_b:
-        print(f"\n--- Files touched ---")
-        if both:
-            print(f"  Both ({len(both)}):")
-            for f in sorted(both):
+    fa, fb = touched(a), touched(b)
+    for title, files in (("Both", fa & fb), ("Only A", fa - fb), ("Only B", fb - fa)):
+        if files:
+            print(f"\n  Files touched — {title} ({len(files)}):")
+            for f in sorted(files):
                 print(f"    {f}")
-        if only_a:
-            print(f"  Only A ({len(only_a)}):")
-            for f in sorted(only_a):
-                print(f"    {f}")
-        if only_b:
-            print(f"  Only B ({len(only_b)}):")
-            for f in sorted(only_b):
-                print(f"    {f}")
-
-    print(f"\n{'=' * 80}")
-
-
-def find_by_name(name, project_slug=None, recent=100, all_sessions=False):
-    """Find sessions matching a custom title. Returns list of (path, title) tuples."""
-    sessions = find_all_sessions(project_slug=project_slug, recent=recent, all_sessions=all_sessions)
-    matches = []
-    name_lower = name.lower()
-    for s in sessions:
-        title = get_custom_title(s["path"])
-        if title and name_lower in title.lower():
-            matches.append({**s, "custom_title": title})
-    return matches
-
-
-def cmd_find(args):
-    """Find sessions by custom title (set via /rename)."""
-    name = args["name"]
-    project = args.get("project")
-    recent = int(args.get("recent", 100))
-    all_flag = args.get("all", False)
-    matches = find_by_name(name, project_slug=project, recent=recent, all_sessions=all_flag)
-
-    if not matches:
-        print(f'No sessions with title matching "{name}".')
-        print("Titles are set via /rename in Claude Code.")
-        return
-
-    print(f'Sessions matching title "{name}" ({len(matches)} found):\n')
-    print(f"{'#':<4} {'Date':<20} {'Size':>8}  {'Title':<30} {'Session ID'}")
-    print(f"{'─'*4} {'─'*20} {'─'*8}  {'─'*30} {'─'*36}")
-
-    for i, m in enumerate(matches[:20]):
-        date_str = m["mtime"].strftime("%Y-%m-%d %H:%M")
-        size_str = format_bytes(m["size"])
-        title = m["custom_title"][:30]
-        print(f"{i:<4} {date_str:<20} {size_str:>8}  {title:<30} {m['session_id']}")
-
-    print(f"\nPaths:")
-    for i, m in enumerate(matches[:20]):
-        print(f"  {i}: {m['path']}")
-
-    if len(matches) == 1:
-        print(f"\nResume: claude --resume {matches[0]['session_id']}")
-
-
-def resolve_session_path(session_arg=None, args=None):
-    """Resolve a session argument to a full path.
-
-    Accepts:
-      - A file path
-      - A session UUID
-      - A custom title (from /rename)
-      - --search KEYWORD --index N (via args dict)
-    """
-    # Handle --search + --index combo
-    if args and "search" in args and "index" in args:
-        search_args = {**args, "keyword": args["search"]}
-        return resolve_search_index(search_args)
-
-    if session_arg is None:
-        print("No session specified. Provide a path, UUID, name, or --search KEYWORD --index N.")
-        return None
-
-    if os.path.isfile(session_arg):
-        return session_arg
-
-    # Try as session UUID
-    for proj_dir in PROJECTS_DIR.iterdir():
-        if not proj_dir.is_dir():
-            continue
-        candidate = proj_dir / f"{session_arg}.jsonl"
-        if candidate.exists():
-            return str(candidate)
-
-    # Try as custom title
-    matches = find_by_name(session_arg)
-    if len(matches) == 1:
-        return matches[0]["path"]
-    if len(matches) > 1:
-        print(f'Multiple sessions match title "{session_arg}":')
-        for i, m in enumerate(matches):
-            print(f"  {i}: [{m['custom_title']}] {m['path']}")
-        print("Be more specific or use a full path.")
-        return None
-
-    print(f"Session not found: {session_arg}")
-    print("Provide a full path, session UUID, custom title, or --search KEYWORD --index N.")
-    return None
 
 
 # --- CLI ---
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
-        sys.exit(1)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
 
-    cmd = sys.argv[1]
-    args = {}
+    def scope(sp, recent):
+        sp.add_argument("--project", help="project slug, repo path, or . for the current dir")
+        sp.add_argument("--recent", type=int, default=recent, help=f"newest N sessions (default {recent or 'all'})")
+        sp.add_argument("--all", action="store_true", help="no --recent limit")
 
-    # Parse remaining args
-    i = 2
-    positionals = []
-    while i < len(sys.argv):
-        arg = sys.argv[i]
-        if arg.startswith("--"):
-            key = arg[2:]
-            if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
-                args[key] = sys.argv[i + 1]
-                i += 2
-            else:
-                args[key] = True
-                i += 1
-        else:
-            positionals.append(arg)
-            i += 1
+    def one(name, help_, **kw):
+        sp = sub.add_parser(name, help=help_)
+        sp.add_argument("session", nargs="?", help="path | self | UUID/prefix | pr:N | title")
+        sp.add_argument("--search", metavar="KEYWORD", help="pick the session from search results...")
+        sp.add_argument("--index", type=int, help="...at this index")
+        scope(sp, 50)
+        return sp
 
-    # Map positionals to named args based on command
-    if cmd == "search" and positionals:
-        args["keyword"] = positionals[0]
-    elif cmd == "find" and positionals:
-        args["name"] = positionals[0]
-    elif cmd == "diff":
-        if len(positionals) >= 1:
-            args["session_a"] = positionals[0]
-        if len(positionals) >= 2:
-            args["session_b"] = positionals[1]
-    elif cmd in ("summary", "conversation", "tools") and positionals:
-        args["session"] = positionals[0]
+    sub.add_parser("live", help="running Claude Code sessions").set_defaults(fn=cmd_live)
+    sp = sub.add_parser("list", help="recent sessions, newest first")
+    scope(sp, 20)
+    sp.set_defaults(fn=cmd_list)
+    sp = sub.add_parser("find", help="sessions by title (/rename name or auto title)")
+    sp.add_argument("name")
+    scope(sp, None)
+    sp.set_defaults(fn=cmd_find)
+    sp = sub.add_parser("search", help="sessions containing a keyword (incl. tool results, subagents)")
+    sp.add_argument("keyword")
+    sp.add_argument("--index", type=int, help="print only the path of match N")
+    scope(sp, 50)
+    sp.set_defaults(fn=cmd_search)
+    sp = sub.add_parser("provenance", help="which sessions/subagents wrote or edited a file")
+    sp.add_argument("file", help="path (exact match if it exists) or substring")
+    scope(sp, None)
+    sp.set_defaults(fn=cmd_provenance)
 
-    if cmd == "list":
-        cmd_list(args)
-    elif cmd == "search":
-        if "keyword" not in args:
-            print("Usage: analyzer.py search KEYWORD [--project SLUG] [--recent N] [--all] [--verbose]")
-            sys.exit(1)
-        cmd_search(args)
-    elif cmd == "find":
-        if "name" not in args:
-            print("Usage: analyzer.py find NAME [--project SLUG] [--recent N]")
-            sys.exit(1)
-        cmd_find(args)
-    elif cmd == "summary":
-        if "session" not in args and "search" not in args:
-            print("Usage: analyzer.py summary SESSION_PATH_OR_ID [--deep] [--verbose]")
-            print("       analyzer.py summary --search KEYWORD --index N [--deep]")
-            sys.exit(1)
-        cmd_summary(args)
-    elif cmd == "conversation":
-        if "session" not in args and "search" not in args:
-            print("Usage: analyzer.py conversation SESSION_PATH [--max-chars N]")
-            print("       analyzer.py conversation --search KEYWORD --index N")
-            sys.exit(1)
-        cmd_conversation(args)
-    elif cmd == "tools":
-        if "session" not in args and "search" not in args:
-            print("Usage: analyzer.py tools SESSION_PATH")
-            print("       analyzer.py tools --search KEYWORD --index N")
-            sys.exit(1)
-        cmd_tools(args)
-    elif cmd == "diff":
-        if "session_a" not in args or "session_b" not in args:
-            print("Usage: analyzer.py diff SESSION_A SESSION_B")
-            sys.exit(1)
-        cmd_diff(args)
-    else:
-        print(f"Unknown command: {cmd}")
-        print(__doc__)
+    sp = one("summary", "overview of one session")
+    sp.add_argument("--deep", action="store_true", help="aggregate subagent transcripts too")
+    sp.add_argument("--verbose", action="store_true", help="entry type counts, flag unknown types")
+    sp.set_defaults(fn=cmd_summary)
+    one("agents", "subagent table: type, description, time, tokens").set_defaults(fn=cmd_agents)
+    sp = one("conversation", "prompts, notifications, and assistant text in order")
+    sp.add_argument("--max-chars", type=int, default=500)
+    sp.set_defaults(fn=cmd_conversation)
+    one("tools", "tool call timeline with result sizes").set_defaults(fn=cmd_tools)
+    sp = one("signals", "confusion / deviation / rework keywords in assistant text")
+    sp.add_argument("--category", action="append", choices=list(SIGNALS))
+    sp.add_argument("--words", help="comma-separated custom keywords (replaces the built-in set)")
+    sp.add_argument("--limit", type=int, default=3, help="snippets per category per transcript")
+    sp.set_defaults(fn=cmd_signals)
+    one("efficiency", "context audit: growth, repeated reads, big results, notification turns").set_defaults(
+        fn=cmd_efficiency)
+
+    sp = sub.add_parser("diff", help="compare two sessions")
+    sp.add_argument("session_a")
+    sp.add_argument("session_b")
+    sp.set_defaults(fn=cmd_diff, search=None)
+
+    args = p.parse_args()
+    try:
+        args.fn(args)
+    except BrokenPipeError:
+        # Reader closed early (e.g. `| head`, `| grep -m1`): silence the flush at exit.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         sys.exit(1)
 
 
