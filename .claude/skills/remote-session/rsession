@@ -12,6 +12,9 @@ usage: rsession <command> [args]
                                   print the claude.ai URL, then send [prompt] if given
   peek  <name> [lines]            show the session's screen (lines = scrollback depth)
   send  <name> <text...>          type text into the session and press Enter
+  state <name>                    print busy | background | dialog | idle | exited | gone
+  wait  <name> [timeout-secs]     block until the session needs input; print why
+                                  (idle=0, dialog=2, exited/gone=3, timeout=124)
   ls                              list rsession/remote-claude tmux sessions
   kill  <name>                    kill the session
 
@@ -26,6 +29,25 @@ cmd="$1"
 shift
 
 pane() { tmux capture-pane -pt "claude-$1" ${2:+-S "-$2"}; }
+
+# Classify a session from its screen. Only the bottom of the screen is read, so
+# finished output higher up cannot look busy; the input line is never read for
+# content (it may hold the TUI's ghost-text suggestion).
+state() {
+    local session="claude-$1" bottom
+    tmux has-session -t "=$session" 2>/dev/null || { echo gone; return; }
+    [ "$(tmux display -p -t "$session" '#{pane_dead}')" = 1 ] && { echo exited; return; }
+    bottom="$(pane "$1" | grep -v '^[[:space:]]*$' | tail -15)"
+    if grep -qE 'Enter to select|Esc to cancel|Do you want to' <<<"$bottom"; then
+        echo dialog    # AskUserQuestion or a permission prompt
+    elif grep -qE '…[[:space:]]*\([0-9]+[ms]' <<<"$bottom"; then
+        echo busy      # spinner or running tool: "Zesting… (3m 12s ·", "cmd… (13s ·"
+    elif grep -qE '· [0-9]+ (shells?|agents?|tasks?|monitors?)\b' <<<"$bottom"; then
+        echo background  # turn ended but background work will wake it: "· 1 shell"
+    else
+        echo idle
+    fi
+}
 
 case "$cmd" in
 spawn)
@@ -91,7 +113,7 @@ spawn)
         tmux send-keys -t "$session" Enter
         echo "  sent: $*"
     fi
-    echo "  peek: rsession peek $name    send: rsession send $name <text>"
+    echo "  peek: rsession peek $name    send: rsession send $name <text>    wait: rsession wait $name"
     ;;
 peek)
     [ $# -ge 1 ] || usage
@@ -104,6 +126,34 @@ send)
     tmux send-keys -t "claude-$name" -l -- "$*"
     sleep 0.5
     tmux send-keys -t "claude-$name" Enter
+    ;;
+state)
+    [ $# -ge 1 ] || usage
+    state "$1"
+    ;;
+wait)
+    # idle/dialog must hold for RSESSION_SETTLE polls (default 3, ~6s), so a
+    # wait started right after `send` or a keypress doesn't return on the
+    # screen from before the session picked the input up.
+    [ $# -ge 1 ] || usage
+    name="$1"
+    timeout="${2:-1800}"
+    settle="${RSESSION_SETTLE:-3}"
+    start=$SECONDS
+    prev=""
+    same=0
+    while :; do
+        st="$(state "$name")"
+        [ "$st" = "$prev" ] && same=$((same + 1)) || same=1
+        prev="$st"
+        case "$st" in
+        gone | exited) echo "$st"; exit 3 ;;
+        dialog) [ "$same" -ge "$settle" ] && { echo dialog; exit 2; } ;;
+        idle) [ "$same" -ge "$settle" ] && { echo idle; exit 0; } ;;
+        esac
+        [ $((SECONDS - start)) -ge "$timeout" ] && { echo "timeout ($st)"; exit 124; }
+        sleep 2
+    done
     ;;
 ls)
     tmux list-sessions -F '#{session_name}: #{session_path}' 2>/dev/null \
