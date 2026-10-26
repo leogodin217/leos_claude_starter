@@ -961,9 +961,10 @@ def render_body_template(spec: NewNoteSpec, today: date) -> str:
     """Render the per-type body template.
 
     All types receive an H1 title and a `## Log` section seeded with a
-    creation entry. Findings additionally get `## Problem` and `## Analysis`;
-    features get `## Motivation` and `## Sketch`; decisions get
-    `## Context`, `## Decision`, `## Alternatives`; etc. (see SKILL.md).
+    creation entry. Findings additionally get `## Problem`, `## Evidence`,
+    `## Analysis`, and `## Disposition`; features get `## Motivation` and
+    `## Sketch`; decisions get `## Context`, `## Decision`, `## Alternatives`;
+    etc. (see SKILL.md).
 
     Args:
         spec: Validated note inputs.
@@ -975,7 +976,16 @@ def render_body_template(spec: NewNoteSpec, today: date) -> str:
     lines: list[str] = [f"# {spec.title}", ""]
 
     if spec.note_type == "finding":
-        lines += ["## Problem", "", "## Analysis", ""]
+        lines += [
+            "## Problem",
+            "",
+            "## Evidence",
+            "",
+            "## Analysis",
+            "",
+            "## Disposition",
+            "",
+        ]
     elif spec.note_type == "feature":
         lines += ["## Motivation", "", "## Sketch", ""]
     elif spec.note_type == "question":
