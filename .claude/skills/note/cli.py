@@ -961,9 +961,11 @@ def render_body_template(spec: NewNoteSpec, today: date) -> str:
     """Render the per-type body template.
 
     All types receive an H1 title and a `## Log` section seeded with a
-    creation entry. Findings additionally get `## Problem` and `## Analysis`;
-    features get `## Motivation` and `## Sketch`; decisions get
-    `## Context`, `## Decision`, `## Alternatives`; etc. (see SKILL.md).
+    creation entry. Findings additionally get `## Problem`, `## Evidence`,
+    `## Analysis`, and `## Disposition`; features get `## Motivation` and
+    `## Sketch`; decisions get `## Context`, `## Decision`, `## Alternatives`;
+    etc. (see SKILL.md). When initial body content is given it replaces the
+    scaffold sections — the author supplies the structure.
 
     Args:
         spec: Validated note inputs.
@@ -974,8 +976,24 @@ def render_body_template(spec: NewNoteSpec, today: date) -> str:
     """
     lines: list[str] = [f"# {spec.title}", ""]
 
+    if spec.body is not None:
+        # The author supplies the structure (own section headers); seeding
+        # the scaffold too would strand their prose under the last header.
+        lines += [spec.body, ""]
+        lines += ["## Log", f"- {today.isoformat()}: created"]
+        return "\n".join(lines)
+
     if spec.note_type == "finding":
-        lines += ["## Problem", "", "## Analysis", ""]
+        lines += [
+            "## Problem",
+            "",
+            "## Evidence",
+            "",
+            "## Analysis",
+            "",
+            "## Disposition",
+            "",
+        ]
     elif spec.note_type == "feature":
         lines += ["## Motivation", "", "## Sketch", ""]
     elif spec.note_type == "question":
@@ -1006,9 +1024,6 @@ def render_body_template(spec: NewNoteSpec, today: date) -> str:
             "## Alternatives rejected",
             "",
         ]
-
-    if spec.body is not None:
-        lines += [spec.body, ""]
 
     lines += ["## Log", f"- {today.isoformat()}: created"]
 
@@ -1132,7 +1147,10 @@ def cmd_new(config: Config, spec: NewNoteSpec, no_open: bool = False) -> Path:
     today = date.today()
     frontmatter = render_frontmatter(spec, today)
     body = render_body_template(spec, today)
-    full_content = f"{frontmatter}\n{body}\n"
+    # No trailing newline: Obsidian's append prepends exactly one newline,
+    # so an EOF newline here becomes a blank line before the first log
+    # append (and property:set preserves whatever EOF shape the file has).
+    full_content = f"{frontmatter}\n{body}"
 
     # Step 6: Atomic write.
     target = config.vault_path / vault_relpath
@@ -1263,11 +1281,13 @@ def cmd_status(
     if reason is not None:
         log_entry += f" ({reason})"
 
+    # Obsidian's append already separates with a paragraph break; adding our
+    # own leading newline produced double blank lines between log entries.
     has_log = _note_has_log_section(config, vault_path)
     if has_log:
-        append_content = f"\\n{log_entry}"
+        append_content = log_entry
     else:
-        append_content = f"\\n\\n## Log\\n{log_entry}"
+        append_content = f"## Log\\n{log_entry}"
 
     result = obsidian(
         config,

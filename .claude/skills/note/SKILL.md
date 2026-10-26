@@ -55,9 +55,10 @@ Machine registry `~/.config/note.json`:
 ├── decisions/       # type: decision
 ├── research/        # type: research
 ├── plans/           # type: plan
-├── MOCs/            # Bases views — Open Findings, Roadmap, Critical, etc.
-└── _templates/      # one per type
+└── MOCs/            # Bases views — Open Findings, Roadmap, Critical, etc.
 ```
+
+Body scaffolds (the per-type sections) are built into the CLI, not stored in the vault.
 
 Filenames: slug only, lowercase, hyphenated (e.g., `state-store-resume-bug.md`). Date and title live in frontmatter.
 
@@ -133,7 +134,7 @@ All run via `python3 ~/.claude/skills/note/cli.py <command> [args]`.
 
 ### `new <type> "<title>" [options]`
 
-Create a new note. Generates slug, writes frontmatter from per-type template directly to the vault filesystem (atomic write), then opens in Obsidian.
+Create a new note. Generates slug, writes frontmatter and the per-type body scaffold (built into the CLI) directly to the vault filesystem (atomic write), then opens in Obsidian. Findings scaffold `## Problem`, `## Evidence`, `## Analysis`, `## Disposition`.
 
 `repo` is stamped automatically from the binding — you never pass it.
 
@@ -159,7 +160,7 @@ Options:
 - `--code <path> [<path> ...]` (must exist under the current checkout)
 - `--notes "[[other-note]]" ...` (must resolve in vault)
 - `--tags planning-<slug> [...]` (only `planning-*` tags are accepted)
-- `--body "<text>"` (initial body content; appended after template sections)
+- `--body "<text>"` (initial body content; **replaces** the scaffold sections — supply your own `##` headers, e.g. a finding's Problem/Evidence/Analysis/Disposition)
 - `--no-open` (skip opening in GUI)
 
 Top-level overrides (before the subcommand): `--vault <name>`, `--vault-path <path>`, `--repo <name>` for reaching a second vault or repo without editing committed state.
@@ -295,6 +296,15 @@ python3 ~/.claude/skills/note/cli.py new finding "Title" \
   --severity critical --kind bug --area <pkg> \
   --discovered-in code-review --batch <sprint-or-topic> --code <path>
 ```
+
+A finding's reader is a fresh session weeks later with none of your context. Fill the four sections so it passes the **zero-link test** — following no links, the reader can state what is wrong, where to look, and what remains:
+
+- **Problem** (2–4 sentences, first): the symptom with its headline numbers — no session/round shorthand.
+- **Evidence**: where the numbers come from (commit, emit/run id, the probe if short); decode any shorthand here or don't use it.
+- **Analysis**: the reasoning — ownership, interactions with sibling findings, what was considered and dropped. May assume context.
+- **Disposition**: the decision and the surfaces to touch (`file:line`). `--code` validates against the current checkout, so when filing cross-repo cite surfaces in prose instead.
+
+Any later material edit (a disposition rewrite, a partial advance) appends a `## Log` line, so an open finding's log answers *what remains*.
 
 ### Triaging a captured note
 
