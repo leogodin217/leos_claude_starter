@@ -1,6 +1,7 @@
 ---
 name: arch-design
 description: Design architecture docs for new features, refactors, or redesigns. Produces a pending architecture doc describing a specific change — semantics, contracts, invariants. File enumeration happens at sprint planning.
+effort: high
 argument-hint: [feature-name or issue path]
 ---
 

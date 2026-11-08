@@ -2,6 +2,7 @@
 name: arch-review
 description: Review pending architecture docs. Judge whether the design will deliver the change it describes and whether an implementer could build it without inventing semantics.
 agent: architect
+effort: high
 ---
 
 # Architecture Review
